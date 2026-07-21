@@ -108,7 +108,7 @@ func runSync(pl Platform) error {
 		note(err)
 	}
 
-	if err := writeSSHConfig(owned, keyed); err != nil {
+	if err := writeSSHConfig(pl, owned, keyed); err != nil {
 		note(err)
 	}
 
@@ -637,7 +637,13 @@ func sshConfigManagedBlock(owned []device, keyed map[string]cachedPeer, paths ss
 // "absent" (a permission/ACL problem, say) aborts: treating it as an empty file would
 // regenerate the config from the managed block alone and silently discard every Host
 // entry the user wrote by hand.
-func writeSSHConfig(owned []device, keyed map[string]cachedPeer) error {
+//
+// The write is secured exactly like authorized_keys (SecureKeyFile). Without it, an
+// elevated daemon's atomicWrite hands the config the token's default DACL — SYSTEM
+// plus Administrators, but not the user's own SID — so the config the daemon just
+// wrote becomes unreadable to the very user whose ssh must parse it, silently
+// breaking every `ssh <name>` until an elevated takeown repairs the ACL.
+func writeSSHConfig(pl Platform, owned []device, keyed map[string]cachedPeer) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -658,7 +664,10 @@ func writeSSHConfig(owned []device, keyed map[string]cachedPeer) error {
 	if sameContent(path, out) {
 		return nil
 	}
-	return atomicWrite(path, out, 0o600)
+	if err := atomicWrite(path, out, 0o600); err != nil {
+		return err
+	}
+	return pl.SecureKeyFile(path)
 }
 
 // withManagedBlock returns existing with its tailssh-managed region replaced by

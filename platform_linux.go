@@ -16,6 +16,9 @@ import (
 // linuxDaemonUnit is the systemd service name for the tailssh daemon.
 const linuxDaemonUnit = "tailssh-daemon.service"
 
+// termuxDefaultPrefix is Termux's install prefix, used when $PREFIX is unset.
+const termuxDefaultPrefix = "/data/data/com.termux/files/usr"
+
 // linuxPlatform implements Platform for desktop/server Linux and, when running
 // inside Termux (Android), for the Termux userland too. The two variants share
 // most logic; the `termux` flag switches package manager, ports, enable path,
@@ -25,9 +28,24 @@ type linuxPlatform struct {
 }
 
 // newPlatform returns the Linux Platform implementation, detecting Termux at
-// runtime via the $PREFIX Termux sets ("…/com.termux/…").
+// runtime.
 func newPlatform() Platform {
-	return &linuxPlatform{termux: strings.Contains(os.Getenv("PREFIX"), "com.termux")}
+	return &linuxPlatform{termux: runningUnderTermux()}
+}
+
+// runningUnderTermux reports whether the process runs inside Termux, detected via
+// the $PREFIX Termux sets ("…/com.termux/…").
+func runningUnderTermux() bool {
+	return strings.Contains(os.Getenv("PREFIX"), "com.termux")
+}
+
+// termuxPrefix returns Termux's install prefix from $PREFIX, falling back to the
+// default location when it is unset.
+func termuxPrefix() string {
+	if prefix := os.Getenv("PREFIX"); prefix != "" {
+		return prefix
+	}
+	return termuxDefaultPrefix
 }
 
 // OpenURL opens a URL in the default browser (xdg-open) or, on Termux, via the
@@ -43,29 +61,37 @@ func (p *linuxPlatform) OpenURL(url string) error {
 }
 
 // InstallTailscale auto-installs on Linux via the official script. On Termux the
-// tailnet is the Android app: if it is already installed, launch it directly (via
-// `monkey`, which resolves the launcher activity without hardcoding it) so the user
-// can just toggle it on; only fall back to the Play Store when it isn't installed.
+// tailnet is the Android app: if it is already installed, launch it directly so the
+// user can just toggle it on; only fall back to the Play Store when it isn't.
 func (p *linuxPlatform) InstallTailscale() error {
 	if p.termux {
-		// The launcher activity is exported, so `am start -n` works from Termux's
-		// unprivileged uid; the name has changed across app versions, so try the
-		// known ones, then monkey (auto-resolves), then the store as last resort.
-		for _, comp := range []string{
-			"com.tailscale.ipn/.MainActivity",
-			"com.tailscale.ipn/.IPNActivity",
-		} {
-			if exec.Command("am", "start", "-n", comp).Run() == nil {
-				return nil
-			}
-		}
-		if exec.Command("monkey", "-p", "com.tailscale.ipn",
-			"-c", "android.intent.category.LAUNCHER", "1").Run() == nil {
+		if launchTermuxTailscaleApp() {
 			return nil
 		}
 		return p.OpenURL("https://play.google.com/store/apps/details?id=com.tailscale.ipn")
 	}
 	return p.run("sh", "-c", "curl -fsSL https://tailscale.com/install.sh | sh")
+}
+
+// termuxTailscaleActivities are the launcher activity names the Tailscale Android
+// app has used across versions; `am start -n` works from Termux's unprivileged uid
+// because the activity is exported. The name has changed, so callers try each.
+var termuxTailscaleActivities = []string{
+	"com.tailscale.ipn/.MainActivity",
+	"com.tailscale.ipn/.IPNActivity",
+}
+
+// launchTermuxTailscaleApp opens the already-installed Tailscale Android app from
+// Termux, trying each known launcher activity and then `monkey`, which resolves the
+// launcher without a hardcoded activity name. It reports whether the app launched.
+func launchTermuxTailscaleApp() bool {
+	for _, comp := range termuxTailscaleActivities {
+		if exec.Command("am", "start", "-n", comp).Run() == nil {
+			return true
+		}
+	}
+	return exec.Command("monkey", "-p", "com.tailscale.ipn",
+		"-c", "android.intent.category.LAUNCHER", "1").Run() == nil
 }
 
 // Name is the short OS label.
@@ -108,7 +134,7 @@ func have(name string) bool {
 // Android uses mandatory file-based encryption; on Linux we look for a dm-crypt
 // (LUKS) layer under the root filesystem.
 func diskEncryption() (on bool, detail string) {
-	if strings.Contains(os.Getenv("PREFIX"), "com.termux") {
+	if runningUnderTermux() {
 		return true, "Android file-based encryption (mandatory)"
 	}
 	if have("lsblk") {
@@ -126,8 +152,8 @@ func diskEncryption() (on bool, detail string) {
 // sshHostKeyPubPath is where sshd keeps its ed25519 host public key, used to
 // pre-populate peers' known_hosts. Termux keeps it under $PREFIX/etc.
 func sshHostKeyPubPath() string {
-	if prefix := os.Getenv("PREFIX"); strings.Contains(prefix, "com.termux") {
-		return filepath.Join(prefix, "etc", "ssh", "ssh_host_ed25519_key.pub")
+	if runningUnderTermux() {
+		return filepath.Join(os.Getenv("PREFIX"), "etc", "ssh", "ssh_host_ed25519_key.pub")
 	}
 	return "/etc/ssh/ssh_host_ed25519_key.pub"
 }
@@ -212,28 +238,38 @@ func procNetListening(port int) bool {
 	return false
 }
 
-// SSHState reports install + running state using init-aware probes.
+// SSHState reports install + running state using init-aware probes. Termux and
+// hosts with no recognized init have no service manager, so a live sshd (or a
+// listening port) is the running signal.
 func (p *linuxPlatform) SSHState() (installed, running bool) {
 	installed = sshdInstalled()
 	switch {
 	case p.termux:
-		// No service manager under Termux: a live sshd is the signal.
 		running = sshdRunning(p.SSHListenPort())
 	case hasSystemd():
-		// Either the classic "ssh" or "sshd" unit, or an active ssh.socket.
-		for _, u := range []string{"ssh", "sshd", "ssh.socket"} {
-			out, _ := exec.Command("systemctl", "is-active", u).Output()
-			if strings.TrimSpace(string(out)) == "active" {
-				running = true
-				break
-			}
-		}
+		running = systemdSSHActive()
 	case hasOpenRC():
 		running = exec.Command("rc-service", "sshd", "status").Run() == nil
 	default:
 		running = sshdRunning(p.SSHListenPort())
 	}
 	return installed, running
+}
+
+// sshSystemdUnits are the unit names an active SSH server may run under: the
+// classic "ssh"/"sshd" service, or a socket-activated ssh.socket.
+var sshSystemdUnits = []string{"ssh", "sshd", "ssh.socket"}
+
+// systemdSSHActive reports whether systemd considers any SSH unit active, covering
+// the classic ssh/sshd service and socket-activated ssh.socket.
+func systemdSSHActive() bool {
+	for _, u := range sshSystemdUnits {
+		out, _ := exec.Command("systemctl", "is-active", u).Output()
+		if strings.TrimSpace(string(out)) == "active" {
+			return true
+		}
+	}
+	return false
 }
 
 // InstallSSH installs the OpenSSH server via the detected package manager and
@@ -244,41 +280,38 @@ func (p *linuxPlatform) InstallSSH() error {
 		if err := p.run("pkg", "install", "-y", "openssh"); err != nil {
 			return err
 		}
-		_ = p.run("ssh-keygen", "-A") // best-effort host keys under $PREFIX/etc/ssh
+		_ = p.run("ssh-keygen", "-A")
 		return nil
 	}
 
+	if err := p.installOpenSSHServerPackage(); err != nil {
+		return err
+	}
+	_ = p.run("ssh-keygen", "-A")
+	p.openFirewall()
+	return nil
+}
+
+// installOpenSSHServerPackage installs the OpenSSH server through the first
+// available system package manager. DEBIAN_FRONTEND=noninteractive is passed via
+// `env` so it survives the sudo boundary that p.run may insert.
+func (p *linuxPlatform) installOpenSSHServerPackage() error {
 	switch {
 	case have("apt-get"):
-		_ = p.run("apt-get", "update") // best-effort refresh
-		// env DEBIAN_FRONTEND=noninteractive survives the sudo boundary.
-		if err := p.run("env", "DEBIAN_FRONTEND=noninteractive",
-			"apt-get", "install", "-y", "openssh-server"); err != nil {
-			return err
-		}
+		_ = p.run("apt-get", "update")
+		return p.run("env", "DEBIAN_FRONTEND=noninteractive",
+			"apt-get", "install", "-y", "openssh-server")
 	case have("dnf"):
-		if err := p.run("dnf", "install", "-y", "openssh-server"); err != nil {
-			return err
-		}
+		return p.run("dnf", "install", "-y", "openssh-server")
 	case have("yum"):
-		if err := p.run("yum", "install", "-y", "openssh-server"); err != nil {
-			return err
-		}
+		return p.run("yum", "install", "-y", "openssh-server")
 	case have("pacman"):
-		if err := p.run("pacman", "-Sy", "--noconfirm", "openssh"); err != nil {
-			return err
-		}
+		return p.run("pacman", "-Sy", "--noconfirm", "openssh")
 	case have("apk"):
-		if err := p.run("apk", "add", "openssh", "openssh-keygen"); err != nil {
-			return err
-		}
+		return p.run("apk", "add", "openssh", "openssh-keygen")
 	default:
 		return fmt.Errorf("no supported package manager (apt/dnf/yum/pacman/apk) found")
 	}
-
-	_ = p.run("ssh-keygen", "-A") // best-effort: create any missing host keys
-	p.openFirewall()              // best-effort: allow SSH through a live firewall
-	return nil
 }
 
 // openFirewall best-effort opens SSH through a running host firewall. If ufw is
@@ -319,7 +352,7 @@ func daemonUser() string {
 // nothing to warn about. On Termux the boot script is inert without the Termux:Boot
 // app; elsewhere the systemd unit persists on its own.
 func persistenceNote() string {
-	if strings.Contains(os.Getenv("PREFIX"), "com.termux") {
+	if runningUnderTermux() {
 		if in, known := termuxBootInstalled(); known && !in {
 			return "Termux:Boot app not installed — daemon won't auto-start after reboot"
 		}
@@ -379,53 +412,56 @@ func termuxBootDir() (string, error) {
 // termuxShebang returns the interpreter line for Termux boot scripts, using the
 // live $PREFIX so it points at Termux's own sh.
 func termuxShebang() string {
-	prefix := os.Getenv("PREFIX")
-	if prefix == "" {
-		prefix = "/data/data/com.termux/files/usr"
-	}
-	return "#!" + prefix + "/bin/sh\n"
+	return "#!" + termuxPrefix() + "/bin/sh\n"
 }
 
-// EnableSSH makes sshd start on boot and starts it now.
+// EnableSSH makes sshd start on boot and starts it now. With no recognized init
+// system it falls back to a direct sshd start, which has no reboot persistence.
 func (p *linuxPlatform) EnableSSH() error {
-	if p.termux {
-		// Termux:Boot runs every executable in ~/.termux/boot at device boot.
-		dir, err := termuxBootDir()
-		if err != nil {
-			return err
-		}
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		script := termuxShebang() + "sshd\n"
-		path := filepath.Join(dir, "start-sshd")
-		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
-			return err
-		}
-		// Start it now too so the current session is reachable immediately.
-		_ = exec.Command("sshd").Run()
-		return nil
-	}
-
 	switch {
+	case p.termux:
+		return p.enableTermuxSSHOnBoot()
 	case hasSystemd():
-		// The unit is named "ssh" on Debian/Ubuntu and "sshd" on RHEL/Arch.
-		if err := p.run("systemctl", "enable", "--now", "ssh"); err != nil {
-			if err2 := p.run("systemctl", "enable", "--now", "sshd"); err2 != nil {
-				return fmt.Errorf("enable ssh(d): %v / %v", err, err2)
-			}
-		}
+		return p.enableSystemdSSH()
 	case hasOpenRC():
 		if err := p.run("rc-update", "add", "sshd", "default"); err != nil {
 			return err
 		}
-		if err := p.run("rc-service", "sshd", "start"); err != nil {
-			return err
-		}
+		return p.run("rc-service", "sshd", "start")
 	default:
-		// No recognized init: best-effort direct start (no reboot persistence).
 		if err := p.run("sshd"); err != nil {
 			return fmt.Errorf("no init system detected and direct sshd start failed: %w", err)
+		}
+		return nil
+	}
+}
+
+// enableTermuxSSHOnBoot installs a Termux:Boot script that starts sshd at device
+// boot (Termux:Boot runs every executable in ~/.termux/boot) and starts sshd now
+// so the current session is reachable immediately.
+func (p *linuxPlatform) enableTermuxSSHOnBoot() error {
+	dir, err := termuxBootDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	script := termuxShebang() + "sshd\n"
+	path := filepath.Join(dir, "start-sshd")
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		return err
+	}
+	_ = exec.Command("sshd").Run()
+	return nil
+}
+
+// enableSystemdSSH enables and starts the SSH server now, trying both unit names
+// because Debian/Ubuntu ship "ssh" while RHEL/Arch ship "sshd".
+func (p *linuxPlatform) enableSystemdSSH() error {
+	if err := p.run("systemctl", "enable", "--now", "ssh"); err != nil {
+		if err2 := p.run("systemctl", "enable", "--now", "sshd"); err2 != nil {
+			return fmt.Errorf("enable ssh(d): %v / %v", err, err2)
 		}
 	}
 	return nil
@@ -464,15 +500,25 @@ func (p *linuxPlatform) SecureKeyFile(path string) error {
 		return err
 	}
 	if !p.termux {
-		if out, err := exec.Command("getenforce").Output(); err == nil &&
-			strings.TrimSpace(string(out)) == "Enforcing" {
-			// Relabel both the ~/.ssh directory and the key file so sshd's
-			// SELinux policy permits reading them.
-			_ = exec.Command("restorecon", dir).Run()
-			_ = exec.Command("restorecon", path).Run()
-		}
+		restoreSSHKeyLabels(dir, path)
 	}
 	return nil
+}
+
+// selinuxEnforcing reports whether SELinux is in enforcing mode (getenforce).
+func selinuxEnforcing() bool {
+	out, err := exec.Command("getenforce").Output()
+	return err == nil && strings.TrimSpace(string(out)) == "Enforcing"
+}
+
+// restoreSSHKeyLabels relabels the ~/.ssh directory and key file (restorecon) so
+// sshd's SELinux policy is permitted to read them. No-op unless SELinux enforces.
+func restoreSSHKeyLabels(dir, path string) {
+	if !selinuxEnforcing() {
+		return
+	}
+	_ = exec.Command("restorecon", dir).Run()
+	_ = exec.Command("restorecon", path).Run()
 }
 
 // SupportsIPNBus is true on desktop/server Linux (`tailscale debug watch-ipn`
@@ -487,70 +533,61 @@ func (p *linuxPlatform) EnsurePrivilege([]string) (bool, error) { return false, 
 // unit on Linux, or a Termux:Boot script under Termux.
 func (p *linuxPlatform) InstallDaemon(exePath string) error {
 	if p.termux {
-		dir, err := termuxBootDir()
-		if err != nil {
-			return err
-		}
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-		// Supervise the daemon: restart it whenever it exits, so a crash or an
-		// Android kill self-heals. The wake lock is held by THIS script (the loop),
-		// not the daemon: it is app-global, so it keeps the whole Termux process —
-		// supervisor and daemon alike — alive through Doze. Holding it only in the
-		// daemon would let Android reap the wake-lock-less loop, leaving the daemon
-		// unsupervised. Export PREFIX so the daemon detects Termux (port + behavior)
-		// regardless of how the script is launched.
-		prefix := os.Getenv("PREFIX")
-		if prefix == "" {
-			prefix = "/data/data/com.termux/files/usr"
-		}
-		wakelock := "termux-wake-lock\n"
-		if os.Getenv("TAILSSH_BATTERY") == "saver" {
-			wakelock = "" // saver: no wake lock — reachable only while the device is awake
-		}
-		script := termuxShebang() +
-			fmt.Sprintf("export PREFIX=%s\n", prefix) +
-			wakelock +
-			"while true; do\n" +
-			fmt.Sprintf("\t%q daemon\n", exePath) +
-			"\tsleep 5\n" +
-			"done\n"
-		path := filepath.Join(dir, "start-tailssh")
-		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
-			return err
-		}
-		// The boot script is inert without the Termux:Boot app; assist installing it.
-		p.ensureTermuxBoot()
-		return nil
+		return p.installTermuxDaemon(exePath)
 	}
+	return p.installSystemdDaemon(exePath)
+}
 
-	// Run the daemon as the human user (not root) so it manages that user's
-	// ~/.ssh and, crucially, advertises the right SSH login name in /meta. A
-	// root daemon would report "root", which cloud VMs (and any host with
-	// PermitRootLogin no) refuse — breaking `ssh <name>` for that peer.
-	userLine := ""
-	if u := daemonUser(); u != "" && u != "root" {
-		userLine = "User=" + u + "\n"
+// installTermuxDaemon writes the Termux:Boot supervisor script and assists
+// installing the Termux:Boot app that the boot script is inert without.
+func (p *linuxPlatform) installTermuxDaemon(exePath string) error {
+	dir, err := termuxBootDir()
+	if err != nil {
+		return err
 	}
-	unit := fmt.Sprintf(`[Unit]
-Description=tailssh daemon
-After=tailscaled.service network-online.target
-Wants=network-online.target
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	script := termuxDaemonSupervisorScript(exePath)
+	path := filepath.Join(dir, "start-tailssh")
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		return err
+	}
+	p.ensureTermuxBoot()
+	return nil
+}
 
-[Service]
-Type=simple
-%sExecStart=%s daemon
-Restart=always
-RestartSec=5
-MemoryMax=64M
-Nice=10
+// termuxDaemonSupervisorScript builds the Termux:Boot script that supervises the
+// daemon: it restarts the daemon whenever it exits, so a crash or an Android kill
+// self-heals. The wake lock is held by THIS loop, not the daemon, because it is
+// app-global — it keeps the whole Termux process (supervisor and daemon alike)
+// alive through Doze; held only in the daemon, Android could reap the
+// wake-lock-less loop and leave the daemon unsupervised. Under battery-saver mode
+// the wake lock is dropped, so the host is reachable only while the device is
+// awake. PREFIX is exported so the daemon detects Termux (port + behavior)
+// however the script is launched.
+func termuxDaemonSupervisorScript(exePath string) string {
+	wakelock := "termux-wake-lock\n"
+	if os.Getenv("TAILSSH_BATTERY") == "saver" {
+		wakelock = ""
+	}
+	return termuxShebang() +
+		fmt.Sprintf("export PREFIX=%s\n", termuxPrefix()) +
+		wakelock +
+		"while true; do\n" +
+		fmt.Sprintf("\t%q daemon\n", exePath) +
+		"\tsleep 5\n" +
+		"done\n"
+}
 
-[Install]
-WantedBy=multi-user.target
-`, userLine, exePath)
+// installSystemdDaemon renders the daemon's systemd unit, stages it in a
+// user-writable temp file, and installs it as root (the unit directory is
+// root-only). It restarts rather than merely starts the service so a reinstall
+// picks up unit changes such as a new User=, which `enable --now` would not apply
+// to an already-active service.
+func (p *linuxPlatform) installSystemdDaemon(exePath string) error {
+	unit := systemdDaemonUnit(exePath)
 
-	// Stage the unit in a user-writable temp file, then place it as root.
 	tmp, err := os.CreateTemp("", "tailssh-unit-*.service")
 	if err != nil {
 		return err
@@ -578,36 +615,68 @@ WantedBy=multi-user.target
 	if err := p.run("systemctl", "enable", linuxDaemonUnit); err != nil {
 		return err
 	}
-	// restart, not just start: on a reinstall the service may already be active,
-	// and `enable --now` would not pick up unit changes (e.g. a new User=).
 	return p.run("systemctl", "restart", linuxDaemonUnit)
+}
+
+// systemdDaemonUnit renders the systemd unit for the tailssh daemon. It runs as
+// the human user (not root) so the daemon manages that user's ~/.ssh and, in
+// /meta, advertises the right SSH login name: a root daemon would report "root",
+// which cloud VMs and any host with PermitRootLogin=no refuse, breaking
+// `ssh <name>` for that peer.
+func systemdDaemonUnit(exePath string) string {
+	userLine := ""
+	if u := daemonUser(); u != "" && u != "root" {
+		userLine = "User=" + u + "\n"
+	}
+	return fmt.Sprintf(`[Unit]
+Description=tailssh daemon
+After=tailscaled.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+%sExecStart=%s daemon
+Restart=always
+RestartSec=5
+MemoryMax=64M
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+`, userLine, exePath)
 }
 
 // RemoveDaemon uninstalls the daemon service.
 func (p *linuxPlatform) RemoveDaemon() error {
 	if p.termux {
-		dir, err := termuxBootDir()
-		if err != nil {
-			return err
-		}
-		script := filepath.Join(dir, "start-tailssh")
-		// Kill the supervisor loop first so it can't respawn, then the daemon itself,
-		// then release the wake lock the supervisor was holding.
-		_ = exec.Command("pkill", "-f", script).Run()
-		if exe, err := os.Executable(); err == nil {
-			_ = exec.Command("pkill", "-f", exe+" daemon").Run()
-		}
-		_ = exec.Command("termux-wake-unlock").Run()
-		if err := os.Remove(script); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
+		return p.removeTermuxDaemon()
 	}
 
-	_ = p.run("systemctl", "disable", "--now", linuxDaemonUnit) // best-effort
+	_ = p.run("systemctl", "disable", "--now", linuxDaemonUnit)
 	dest := filepath.Join("/etc/systemd/system", linuxDaemonUnit)
 	if err := p.run("rm", "-f", dest); err != nil {
 		return err
 	}
 	return p.run("systemctl", "daemon-reload")
+}
+
+// removeTermuxDaemon stops and uninstalls the Termux daemon. It kills the
+// supervisor loop first so it can't respawn the daemon, then the daemon process,
+// then releases the wake lock the supervisor was holding, and finally deletes the
+// boot script.
+func (p *linuxPlatform) removeTermuxDaemon() error {
+	dir, err := termuxBootDir()
+	if err != nil {
+		return err
+	}
+	script := filepath.Join(dir, "start-tailssh")
+	_ = exec.Command("pkill", "-f", script).Run()
+	if exe, err := os.Executable(); err == nil {
+		_ = exec.Command("pkill", "-f", exe+" daemon").Run()
+	}
+	_ = exec.Command("termux-wake-unlock").Run()
+	if err := os.Remove(script); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -15,6 +16,24 @@ import (
 	"sync"
 	"syscall"
 	"time"
+)
+
+const (
+	// daemonRosterPushActiveInterval is the roster push cadence while at least one
+	// CLI-less peer is online, favouring fast onboarding.
+	daemonRosterPushActiveInterval = 60 * time.Second
+	// daemonRosterPushIdleInterval is the relaxed cadence used when no CLI-less peer
+	// answered, so a tailnet of only desktops does almost no idle work.
+	daemonRosterPushIdleInterval = 5 * time.Minute
+	// daemonFleetSweepInterval paces Taildrop onboarding of devices not yet in the mesh.
+	daemonFleetSweepInterval = 5 * time.Minute
+	// daemonReconcileInterval is Doze-aligned: real-time changes already arrive via
+	// /resync and roster pushes, so this only backstops drift and revocations — rare
+	// enough that a long interval keeps mobile wakeups (and battery) minimal.
+	daemonReconcileInterval = 15 * time.Minute
+	// daemonHealthyStreamDuration is how long a watch-ipn stream must survive before
+	// the transport counts as healthy and the reconnect backoff resets.
+	daemonHealthyStreamDuration = 30 * time.Second
 )
 
 // localUsername is this device's login name, with any Windows DOMAIN\ prefix
@@ -50,115 +69,39 @@ func localUsername() string {
 // and ssh_config in sync with the tailnet at near-zero idle cost: it blocks on the
 // Tailscale IPN bus (desktops) or on the keyserver /resync receiver (Android), and
 // only runs a sync when something actually changed — debounced and serialized.
+//
+// An initial sync and a presence announcement run before the event loop so the device
+// self-corrects even if no event ever arrives. SIGINT/SIGTERM cancels ctx, which tears
+// down the watch-ipn subprocess and unblocks the event loops.
 func runDaemon(pl Platform) error {
-	// Keep the footprint tiny: one OS thread, hard memory ceiling, lazy GC.
-	runtime.GOMAXPROCS(1)
-	debug.SetMemoryLimit(64 << 20)
-	debug.SetGCPercent(40)
+	daemonTuneRuntimeFootprint()
 
 	_, pubLine, err := ensureIdentity(pl)
 	if err != nil {
 		return fmt.Errorf("identity: %w", err)
 	}
 
-	// The keyserver binds exclusively to this device's tailnet IP. Prefer the value
-	// from discover(), but fall back to scanning interfaces for the 100.64/10 address
-	// so a CLI-less node (Termux, no seed yet) still comes up and serves its key —
-	// enough for CLI-capable peers to discover and authorize it inbound.
-	selfIP := ""
-	if devs, err := discover(); err == nil {
-		if self, ok := selfDevice(devs); ok {
-			selfIP = self.ip
-		}
-	}
-	if selfIP == "" {
-		selfIP = selfTailnetIP()
-	}
-	if selfIP == "" {
-		return fmt.Errorf("cannot determine this device's tailnet IP (is Tailscale connected?)")
+	selfIP, err := daemonResolveSelfIP()
+	if err != nil {
+		return err
 	}
 
 	engine := &syncEngine{pl: pl}
 
-	// A /resync POST schedules a debounced (non-relaying) sync. This is the only
-	// change signal on Android, and a belt-and-suspenders one on desktops.
-	ksDebounce := newDebounce(2*time.Second, 10*time.Second, func() { engine.trigger(false) })
-	metaBytes, _ := json.Marshal(nodeMeta{User: localUsername(), OS: pl.Name(), Port: pl.SSHListenPort()})
-	// A CLI peer's push replaces our cached map; adopt it and re-sync so this
-	// CLI-less node rebuilds ssh_config/authorized_keys against the new peers.
-	onRoster := func(raw []byte) {
-		if changed, err := saveRosterCache(raw); err == nil && changed {
-			engine.trigger(false)
-		}
-	}
-	ks, err := startKeyserver(selfIP, pubLine, string(metaBytes), readHostKey(pl.SSHListenPort()), rosterJSON, ksDebounce.arm, onRoster)
+	ks, ksDebounce, err := daemonStartKeyserver(pl, selfIP, pubLine, engine)
 	if err != nil {
 		return fmt.Errorf("keyserver: %w", err)
 	}
 	defer ks.Close()
 
-	// Cancelling ctx tears down the watch-ipn subprocess and unblocks the event loops.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	log.Printf("daemon: %s up on %s (ipn-bus=%v)", pl.Name(), selfIP, pl.SupportsIPNBus())
 
-	// One initial sync self-corrects even if no event ever arrives.
 	engine.trigger(false)
-
-	// Announce ourselves so peers already on the tailnet re-sync and authorize us —
-	// joining the mesh doesn't change the netmap, so nothing else nudges them — and
-	// push our roster to any CLI-less peer so it can reach everyone without a seed.
-	if devs, err := discover(); err == nil {
-		announceAll(devs)
-		pushRoster(devs)
-	}
-
-	// Only nodes with the tailscale CLI can seed the mesh. Two cadences:
-	if _, err := tailscaleBin(); err == nil {
-		// Roster push. Starting tailssh doesn't change the tailnet netmap, so a
-		// freshly-installed CLI-less peer (a phone) raises no event for watchIPN to
-		// catch — this steady push is how it gets discovered. The cadence is adaptive:
-		// 60s while any CLI-less peer is online (fast onboarding), relaxing to 5m when
-		// there are none, so a tailnet of only desktops does almost no idle work.
-		// onRoster only re-syncs the receiver when the roster changed, so repeated
-		// identical pushes are effectively free on the phone too.
-		go func() {
-			const active, idle = 60 * time.Second, 5 * time.Minute
-			interval := active
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(interval):
-					pushed := 0
-					if devs, err := discover(); err == nil {
-						pushed = pushRoster(devs)
-					}
-					if pushed > 0 {
-						interval = active
-					} else {
-						interval = idle
-					}
-				}
-			}
-		}()
-		// Fleet onboarding (Taildrop push to devices not yet in the mesh), slower.
-		fleet := newOnboardState()
-		go fleetSweep(fleet)
-		go func() {
-			t := time.NewTicker(5 * time.Minute)
-			defer t.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-t.C:
-					fleetSweep(fleet)
-				}
-			}
-		}()
-	}
+	daemonAnnouncePresence()
+	daemonStartSeedLoops(ctx)
 
 	if pl.SupportsIPNBus() {
 		watchIPN(ctx, engine)
@@ -166,13 +109,126 @@ func runDaemon(pl Platform) error {
 		pollLoop(ctx, engine)
 	}
 
-	// Order matters: stop scheduling new syncs before draining the in-flight one, so
-	// nothing can write files after we return.
-	ksDebounce.Stop()
-	engine.shutdown()
+	daemonStopSyncing(ksDebounce, engine)
 
 	log.Printf("daemon: shutting down")
 	return nil
+}
+
+// daemonTuneRuntimeFootprint keeps the resident footprint tiny — one OS thread, a hard
+// memory ceiling and lazy GC — since the daemon idles on every device, phones included.
+func daemonTuneRuntimeFootprint() {
+	runtime.GOMAXPROCS(1)
+	debug.SetMemoryLimit(64 << 20)
+	debug.SetGCPercent(40)
+}
+
+// daemonResolveSelfIP returns this device's tailnet IP, which the keyserver binds to
+// exclusively. It prefers the value from discover() and falls back to scanning
+// interfaces for the 100.64/10 address, so a CLI-less node (Termux, no seed yet) still
+// comes up and serves its key — enough for CLI-capable peers to discover and authorize
+// it inbound.
+func daemonResolveSelfIP() (string, error) {
+	if devs, err := discover(); err == nil {
+		if self, ok := selfDevice(devs); ok && self.ip != "" {
+			return self.ip, nil
+		}
+	}
+	if ip := selfTailnetIP(); ip != "" {
+		return ip, nil
+	}
+	return "", fmt.Errorf("cannot determine this device's tailnet IP (is Tailscale connected?)")
+}
+
+// daemonStartKeyserver brings up the key/meta/roster endpoints and returns the debounce
+// that a /resync POST arms — the only change signal on Android, and a
+// belt-and-suspenders one on desktops. A CLI peer's roster push replaces our cached map,
+// which we adopt and re-sync so this node rebuilds ssh_config/authorized_keys against
+// the new peers.
+func daemonStartKeyserver(pl Platform, selfIP, pubLine string, engine *syncEngine) (io.Closer, *debounce, error) {
+	resyncDebounce := newDebounce(2*time.Second, 10*time.Second, func() { engine.trigger(false) })
+	metaBytes, _ := json.Marshal(nodeMeta{User: localUsername(), OS: pl.Name(), Port: pl.SSHListenPort()})
+	adoptRoster := func(raw []byte) {
+		if changed, err := saveRosterCache(raw); err == nil && changed {
+			engine.trigger(false)
+		}
+	}
+	ks, err := startKeyserver(selfIP, pubLine, string(metaBytes), readHostKey(pl.SSHListenPort()), rosterJSON, resyncDebounce.arm, adoptRoster)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ks, resyncDebounce, nil
+}
+
+// daemonAnnouncePresence nudges peers already on the tailnet to re-sync and authorize us
+// — joining the mesh doesn't change the netmap, so nothing else wakes them — and pushes
+// our roster to any CLI-less peer so it can reach everyone without a seed.
+func daemonAnnouncePresence() {
+	devs, err := discover()
+	if err != nil {
+		return
+	}
+	announceAll(devs)
+	pushRoster(devs)
+}
+
+// daemonStartSeedLoops starts the background loops only a node with the tailscale CLI
+// can run, and is a no-op where the CLI is absent (Termux/Android).
+func daemonStartSeedLoops(ctx context.Context) {
+	if _, err := tailscaleBin(); err != nil {
+		return
+	}
+	go daemonPushRosterLoop(ctx)
+	go daemonSweepFleetLoop(ctx)
+}
+
+// daemonPushRosterLoop keeps CLI-less peers discoverable. Starting tailssh doesn't
+// change the tailnet netmap, so a freshly-installed peer (a phone) raises no event for
+// watchIPN to catch — this steady push is how it gets discovered. The receiver only
+// re-syncs when the roster actually changed, so repeated identical pushes are free.
+func daemonPushRosterLoop(ctx context.Context) {
+	interval := daemonRosterPushActiveInterval
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+			pushed := 0
+			if devs, err := discover(); err == nil {
+				pushed = pushRoster(devs)
+			}
+			if pushed > 0 {
+				interval = daemonRosterPushActiveInterval
+			} else {
+				interval = daemonRosterPushIdleInterval
+			}
+		}
+	}
+}
+
+// daemonSweepFleetLoop onboards devices not yet in the mesh via Taildrop, sweeping once
+// at startup and then on a slow ticker.
+func daemonSweepFleetLoop(ctx context.Context) {
+	fleet := newOnboardState()
+	go fleetSweep(fleet)
+
+	t := time.NewTicker(daemonFleetSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fleetSweep(fleet)
+		}
+	}
+}
+
+// daemonStopSyncing stops scheduling new syncs before draining the in-flight one, in
+// that order, so nothing can write files after runDaemon returns.
+func daemonStopSyncing(resyncDebounce *debounce, engine *syncEngine) {
+	resyncDebounce.Stop()
+	engine.shutdown()
 }
 
 // syncEngine serializes runSync calls. At most one runs at a time; a trigger that
@@ -283,27 +339,36 @@ func newDebounce(d, maxD time.Duration, fn func()) *debounce {
 func (b *debounce) arm() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.beginBurstIfIdle()
 	if b.timer == nil {
-		if b.maxD > 0 {
-			b.deadline = time.Now().Add(b.maxD)
-		}
 		b.timer = time.AfterFunc(b.d, b.fire)
 		return
 	}
-	// A fired-but-not-rearmed timer starts a fresh burst.
+	b.timer.Reset(b.waitCappedByDeadline())
+}
+
+// beginBurstIfIdle opens a new burst deadline when none is pending, which covers both
+// the very first arm and a timer that already fired but was not rearmed since.
+func (b *debounce) beginBurstIfIdle() {
 	if b.maxD > 0 && b.deadline.IsZero() {
 		b.deadline = time.Now().Add(b.maxD)
 	}
+}
+
+// waitCappedByDeadline is the quiet window d, shortened so the timer never fires past
+// the current burst deadline.
+func (b *debounce) waitCappedByDeadline() time.Duration {
 	wait := b.d
-	if !b.deadline.IsZero() {
-		if rem := time.Until(b.deadline); rem < wait {
-			wait = rem
-			if wait < 0 {
-				wait = 0
-			}
+	if b.deadline.IsZero() {
+		return wait
+	}
+	if rem := time.Until(b.deadline); rem < wait {
+		wait = rem
+		if wait < 0 {
+			wait = 0
 		}
 	}
-	b.timer.Reset(wait)
+	return wait
 }
 
 // fire runs the callback and closes the current burst so the next arm() starts fresh.
@@ -328,7 +393,8 @@ func (b *debounce) Stop() {
 
 // watchIPN follows `tailscale debug watch-ipn`, arming a debounced sync on every
 // netmap change, and respawns the stream with capped backoff whenever it drops
-// (e.g. tailscaled restart), running an immediate sync on each reconnect.
+// (e.g. tailscaled restart), running an immediate sync on each reconnect so changes
+// missed while disconnected are still caught.
 func watchIPN(ctx context.Context, engine *syncEngine) {
 	ipnDebounce := newDebounce(2*time.Second, 10*time.Second, func() { engine.trigger(true) })
 	defer ipnDebounce.Stop()
@@ -342,8 +408,7 @@ func watchIPN(ctx context.Context, engine *syncEngine) {
 		if err != nil {
 			log.Printf("daemon: watch-ipn ended: %v", err)
 		}
-		// A stream that survived a while means the transport is healthy: reset backoff.
-		if time.Since(start) > 30*time.Second {
+		if time.Since(start) > daemonHealthyStreamDuration {
 			attempt = 0
 		}
 		wait := backoff(attempt, time.Second, 30*time.Second)
@@ -353,17 +418,21 @@ func watchIPN(ctx context.Context, engine *syncEngine) {
 			return
 		case <-time.After(wait):
 		}
-		// Immediate sync on reconnect catches any change missed while disconnected.
 		engine.trigger(true)
 	}
 }
 
 // ipnNotify is the minimal shape we decode from the watch-ipn stream. Netmaps can
 // exceed 64 KiB and be pretty-printed, so we stream-decode with json.Decoder and keep
-// the payloads as RawMessage — we never parse peers here (sync re-reads status).
+// the payload as RawMessage — we never parse peers here (sync re-reads status).
 type ipnNotify struct {
 	NetMap json.RawMessage `json:"NetMap"`
-	Engine json.RawMessage `json:"Engine"`
+}
+
+// carriesNetmap reports whether the frame is a real netmap change; engine and stats
+// frames arrive on the same stream and must not trigger a sync.
+func (n ipnNotify) carriesNetmap() bool {
+	return len(n.NetMap) > 0 && string(n.NetMap) != "null"
 }
 
 // streamIPN runs one watch-ipn subprocess to completion, arming deb on each netmap
@@ -384,11 +453,7 @@ func streamIPN(ctx context.Context, deb *debounce) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	// Always reap the child and close the pipe, even on early return.
-	defer func() {
-		cancel()
-		cmd.Wait()
-	}()
+	defer daemonReapWatcher(cancel, cmd)
 
 	dec := json.NewDecoder(stdout)
 	for {
@@ -396,27 +461,25 @@ func streamIPN(ctx context.Context, deb *debounce) error {
 		if err := dec.Decode(&n); err != nil {
 			return err
 		}
-		// Only a real netmap counts as a change; ignore engine/stats frames.
-		if len(n.NetMap) > 0 && string(n.NetMap) != "null" {
+		if n.carriesNetmap() {
 			deb.arm()
 		}
 	}
 }
 
+// daemonReapWatcher terminates the watch-ipn subprocess and waits for it, which also
+// closes the stdout pipe. Must run on every return path or the child is left orphaned.
+func daemonReapWatcher(cancel context.CancelFunc, cmd *exec.Cmd) {
+	cancel()
+	cmd.Wait()
+}
+
 // pollLoop is the Android/no-bus path. It relies on the keyserver /resync receiver
 // plus the initial sync, and additionally reconciles on a slow ticker so revoked keys
 // are pruned and drift is corrected even when no /resync ever arrives (these devices
-// have no IPN bus to notice changes). Set reconcileInterval <= 0 to disable.
+// have no IPN bus to notice changes).
 func pollLoop(ctx context.Context, engine *syncEngine) {
-	// 15 minutes, Doze-aligned: real-time changes already arrive via the /resync and
-	// roster pushes, so this only backstops drift/revocations — rare enough that a
-	// long interval keeps mobile wakeups (and battery) minimal.
-	const reconcileInterval = 15 * time.Minute
-	if reconcileInterval <= 0 {
-		<-ctx.Done()
-		return
-	}
-	t := time.NewTicker(reconcileInterval)
+	t := time.NewTicker(daemonReconcileInterval)
 	defer t.Stop()
 	for {
 		select {

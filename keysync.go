@@ -75,14 +75,15 @@ func selfDevice(devs []device) (device, bool) {
 }
 
 // runSync performs one full key-exchange pass. It returns an error only when the
-// tailnet membership can't be read (discover failed); per-peer and per-file
-// problems are logged and tolerated so a single flaky peer never fails the sync.
+// tailnet membership can't be read (discover failed) — with no live membership no
+// managed block is touched, so a blind pass can never prune a peer. Per-peer and
+// per-file problems are logged and tolerated so a single flaky peer never fails the
+// sync.
 func runSync(pl Platform) error {
 	defer debug.FreeOSMemory()
 
 	devs, err := discover()
 	if err != nil {
-		// No live membership → do not touch (or prune) any managed block.
 		return err
 	}
 	self, ok := selfDevice(devs)
@@ -90,51 +91,8 @@ func runSync(pl Platform) error {
 		return fmt.Errorf("sync: no self device in tailnet status")
 	}
 
-	// Trusted set = same-owner peers present in this successful discover().
-	// (Peers absent here are pruned; other owners are excluded entirely.)
-	var owned []device
-	for _, d := range devs {
-		if d.self || d.ip == "" {
-			continue
-		}
-		if self.owner == "" || d.owner != self.owner {
-			continue
-		}
-		owned = append(owned, d)
-	}
-	sort.Slice(owned, func(i, j int) bool { return owned[i].name < owned[j].name })
-
-	// Online peers only; offline ones fall back to the cache below.
-	fetched := fetchPeerKeys(owned)
-
-	// Merge fetched keys with the cache: fresh key wins; otherwise reuse the
-	// last-known key so an offline/unreachable peer is retained, not dropped.
-	cache := loadPeers()
-	now := time.Now().UTC()
-	newCache := make(map[string]cachedPeer, len(owned))
-	for _, p := range owned {
-		info := fetched[p.name]
-		key, usr, prt, hk, at := info.pubkey, info.user, info.port, info.hostKey, now
-		if key == "" {
-			// Offline/unreachable: reuse the whole last-known entry, if any.
-			if c, ok := cache[p.name]; ok {
-				key, usr, prt, hk, at = c.Pubkey, c.User, c.Port, c.HostKey, c.FetchedAt
-			}
-		} else if c, ok := cache[p.name]; ok {
-			// Fresh key, but an individual best-effort field (/meta, /hostkey) may
-			// have failed this pass → keep the last-known value, don't clobber it.
-			if usr == "" && prt == 0 {
-				usr, prt = c.User, c.Port
-			}
-			if hk == "" {
-				hk = c.HostKey
-			}
-		}
-		if key == "" {
-			continue // no fresh and no cached key → nothing to authorize yet
-		}
-		newCache[p.name] = cachedPeer{Name: p.name, IP: p.ip, OS: p.os, Pubkey: key, User: usr, Port: prt, HostKey: hk, FetchedAt: at}
-	}
+	owned := syncTrustedPeers(devs, self)
+	keyed := syncMergePeerCache(owned, fetchPeerKeys(owned), loadPeers(), time.Now().UTC())
 
 	var firstErr error
 	note := func(e error) {
@@ -146,37 +104,97 @@ func runSync(pl Platform) error {
 		}
 	}
 
-	// authorized_keys managed block, sorted for stable output.
-	names := make([]string, 0, len(newCache))
-	for n := range newCache {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	var keyLines []string
-	for _, n := range names {
-		keyLines = append(keyLines, newCache[n].Pubkey)
-	}
-	if err := writeAuthorizedKeys(pl, strings.Join(keyLines, "\n")); err != nil {
+	if err := writeAuthorizedKeys(pl, syncPubkeyLines(keyed)); err != nil {
 		note(err)
 	}
 
-	if err := writeSSHConfig(owned, newCache); err != nil {
+	if err := writeSSHConfig(owned, keyed); err != nil {
 		note(err)
 	}
 
-	if err := writeKnownHosts(newCache); err != nil {
+	if err := writeKnownHosts(keyed); err != nil {
 		note(err)
 	}
 
-	if err := savePeers(newCache); err != nil {
+	if err := savePeers(keyed); err != nil {
 		note(err)
 	}
 
 	return firstErr
 }
 
+// syncTrustedPeers is the set one sync pass may authorize: same-owner, addressable
+// peers present in this successful discover(). Peers absent from it are pruned (they
+// left the tailnet or changed owner); other owners are excluded entirely.
+func syncTrustedPeers(devs []device, self device) []device {
+	var owned []device
+	for _, d := range devs {
+		if d.self || d.ip == "" {
+			continue
+		}
+		if self.owner == "" || d.owner != self.owner {
+			continue
+		}
+		owned = append(owned, d)
+	}
+	sort.Slice(owned, func(i, j int) bool { return owned[i].name < owned[j].name })
+	return owned
+}
+
+// syncMergePeerCache folds this pass's fetches into the on-disk cache, one entry per
+// owned peer. A freshly fetched key wins; an offline or unreachable peer keeps its
+// whole last-known entry instead of being dropped. When the key is fresh but a
+// best-effort field (/meta, /hostkey) failed this pass, the cached value is retained
+// rather than clobbered. A peer with neither a fresh nor a cached key is omitted —
+// there is nothing to authorize for it yet.
+func syncMergePeerCache(owned []device, fetched map[string]peerInfo, cache map[string]cachedPeer, now time.Time) map[string]cachedPeer {
+	merged := make(map[string]cachedPeer, len(owned))
+	for _, p := range owned {
+		info := fetched[p.name]
+		key, usr, prt, hk, at := info.pubkey, info.user, info.port, info.hostKey, now
+		if key == "" {
+			if c, ok := cache[p.name]; ok {
+				key, usr, prt, hk, at = c.Pubkey, c.User, c.Port, c.HostKey, c.FetchedAt
+			}
+		} else if c, ok := cache[p.name]; ok {
+			if usr == "" && prt == 0 {
+				usr, prt = c.User, c.Port
+			}
+			if hk == "" {
+				hk = c.HostKey
+			}
+		}
+		if key == "" {
+			continue
+		}
+		merged[p.name] = cachedPeer{Name: p.name, IP: p.ip, OS: p.os, Pubkey: key, User: usr, Port: prt, HostKey: hk, FetchedAt: at}
+	}
+	return merged
+}
+
+// peerNamesSorted lists the cache's peer names in order, so every generated file is
+// byte-stable across passes and an unchanged file can be skipped.
+func peerNamesSorted(keyed map[string]cachedPeer) []string {
+	names := make([]string, 0, len(keyed))
+	for n := range keyed {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// syncPubkeyLines renders the authorized_keys managed-block body.
+func syncPubkeyLines(keyed map[string]cachedPeer) string {
+	var lines []string
+	for _, n := range peerNamesSorted(keyed) {
+		lines = append(lines, keyed[n].Pubkey)
+	}
+	return strings.Join(lines, "\n")
+}
+
 // fetchPeerKeys pulls /pubkey from every online peer concurrently (<=8 workers)
-// under a 60s deadline, returning name→validated-key for the successes only.
+// under a 60s deadline, returning name→validated-key for the successes only. Offline
+// peers and per-peer failures are simply absent: the cache covers them.
 func fetchPeerKeys(peers []device) map[string]peerInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -188,22 +206,17 @@ func fetchPeerKeys(peers []device) map[string]peerInfo {
 
 	for _, p := range peers {
 		if !p.online || p.ip == "" {
-			continue // can't fetch from an offline peer; cache covers it
+			continue
 		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(p device) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			line, err := fetchPubkey(ctx, p.ip)
-			if err != nil {
-				return // per-peer failure → caller uses the cached key
+			info, ok := fetchPeerInfo(ctx, p.ip)
+			if !ok {
+				return
 			}
-			info := peerInfo{pubkey: line}
-			if m, e := fetchMeta(ctx, p.ip); e == nil { // /meta is best-effort
-				info.user, info.port = m.User, m.Port
-			}
-			info.hostKey = fetchHostKey(ctx, p.ip) // best-effort; "" on failure
 			mu.Lock()
 			out[p.name] = info
 			mu.Unlock()
@@ -213,8 +226,26 @@ func fetchPeerKeys(peers []device) map[string]peerInfo {
 	return out
 }
 
+// fetchPeerInfo collects everything one peer serves this pass. Only /pubkey is
+// required: /meta and /hostkey are best-effort, so a peer answering with a key alone
+// still joins the mesh and falls back to its cached user, port and host key.
+func fetchPeerInfo(ctx context.Context, ip string) (peerInfo, bool) {
+	line, err := fetchPubkey(ctx, ip)
+	if err != nil {
+		return peerInfo{}, false
+	}
+	info := peerInfo{pubkey: line}
+	if m, err := fetchMeta(ctx, ip); err == nil {
+		info.user, info.port = m.User, m.Port
+	}
+	info.hostKey = fetchHostKey(ctx, ip)
+	return info, true
+}
+
 // fetchMeta GETs http://<ip>:8021/meta (3s, <=4 KiB) and decodes the peer's
-// self-description (remote user + sshd port) for ssh_config generation.
+// self-description (remote user + sshd port) for ssh_config generation. A user that
+// fails validSSHUser is blanked rather than trusted — it is written verbatim into
+// ssh_config, where a newline would inject arbitrary directives.
 func fetchMeta(parent context.Context, ip string) (nodeMeta, error) {
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 	defer cancel()
@@ -227,9 +258,6 @@ func fetchMeta(parent context.Context, ip string) (nodeMeta, error) {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nodeMeta{}, err
 	}
-	// The peer-supplied user is written verbatim into ssh_config; a newline (or
-	// any other character) would inject arbitrary directives. Accept only a safe
-	// shell/login charset, treating anything else as empty.
 	if !validSSHUser(m.User) {
 		m.User = ""
 	}
@@ -269,6 +297,16 @@ func sshConfigUser(u string) string {
 	return u
 }
 
+// keysyncFirstLine trims a keyserver response body down to its first line, the only
+// part any of the single-value endpoints carries.
+func keysyncFirstLine(body []byte) string {
+	line := strings.TrimSpace(string(body))
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	return line
+}
+
 // fetchPubkey GETs http://<ip>:8021/pubkey (3s), reads at most 8 KiB, and
 // returns the line only if it parses as a valid ssh-ed25519 authorized key.
 func fetchPubkey(parent context.Context, ip string) (string, error) {
@@ -279,10 +317,7 @@ func fetchPubkey(parent context.Context, ip string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	line := strings.TrimSpace(string(body))
-	if i := strings.IndexByte(line, '\n'); i >= 0 {
-		line = strings.TrimSpace(line[:i]) // first line only
-	}
+	line := keysyncFirstLine(body)
 	if !validEd25519Line(line) {
 		return "", fmt.Errorf("peer %s served an invalid ssh-ed25519 key", ip)
 	}
@@ -300,11 +335,7 @@ func fetchHostKey(parent context.Context, ip string) string {
 	if err != nil {
 		return ""
 	}
-	line := strings.TrimSpace(string(body))
-	if i := strings.IndexByte(line, '\n'); i >= 0 {
-		line = strings.TrimSpace(line[:i])
-	}
-	f := strings.Fields(line)
+	f := strings.Fields(keysyncFirstLine(body))
 	if len(f) < 2 || !validEd25519Line(f[0]+" "+f[1]) {
 		return ""
 	}
@@ -327,7 +358,8 @@ func readHostKey(port int) string {
 
 // scanLocalHostKey retrieves the local sshd's ed25519 host key via ssh-keyscan (a
 // plain SSH handshake to 127.0.0.1) — needs no file access, so it works for an
-// unprivileged daemon. Returns "type base64" or "" on failure.
+// unprivileged daemon. Its output is "127.0.0.1 ssh-ed25519 AAAA..." lines mixed with
+// '#' comment lines. Returns "type base64" or "" on failure.
 func scanLocalHostKey(port int) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
@@ -337,7 +369,6 @@ func scanLocalHostKey(port int) string {
 		return ""
 	}
 	for _, line := range strings.Split(string(out), "\n") {
-		// ssh-keyscan emits "127.0.0.1 ssh-ed25519 AAAA..." plus '#' comment lines.
 		f := strings.Fields(strings.TrimSpace(line))
 		if len(f) >= 3 && validEd25519Line(f[1]+" "+f[2]) {
 			return f[1] + " " + f[2]
@@ -353,6 +384,18 @@ func knownHostsPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "tailssh", "known_hosts"), nil
+}
+
+// sshPortFor resolves a peer's sshd port: the one it advertised via /meta, else the
+// platform default — 8022 on Android, where sshd is Termux's unprivileged one.
+func sshPortFor(peerOS string, advertised int) int {
+	if advertised != 0 {
+		return advertised
+	}
+	if peerOS == "android" {
+		return 8022
+	}
+	return 22
 }
 
 // hostPattern renders the comma-joined known_hosts host patterns for a peer reached
@@ -387,26 +430,13 @@ func writeKnownHosts(keyed map[string]cachedPeer) error {
 	if err != nil {
 		return err
 	}
-	names := make([]string, 0, len(keyed))
-	for n := range keyed {
-		names = append(names, n)
-	}
-	sort.Strings(names)
 	var b strings.Builder
-	for _, n := range names {
+	for _, n := range peerNamesSorted(keyed) {
 		c := keyed[n]
 		if c.HostKey == "" {
 			continue
 		}
-		port := c.Port
-		if port == 0 {
-			if c.OS == "android" {
-				port = 8022
-			} else {
-				port = 22
-			}
-		}
-		if pat := hostPattern(c.Name, c.IP, port); pat != "" {
+		if pat := hostPattern(c.Name, c.IP, sshPortFor(c.OS, c.Port)); pat != "" {
 			fmt.Fprintf(&b, "%s %s\n", pat, c.HostKey)
 		}
 	}
@@ -434,11 +464,29 @@ func postResync(ip string) {
 	resp.Body.Close()
 }
 
-// pushRoster hands each CLI-less peer (Android) this node's full tailnet view, so
-// it can reach every device without a manually supplied seed — the map flows to
-// the phone instead of the phone having to go find it. Only a CLI node's roster is
-// authoritative, so this no-ops from a CLI-less node (its rosterJSON is just its
-// own cache).
+// onlineOwnedPeers returns the reachable peers this node may talk to: online,
+// addressable and sharing self's owner.
+func onlineOwnedPeers(devs []device, self device) []device {
+	var peers []device
+	for _, p := range devs {
+		if p.self || !p.online || p.ip == "" || p.owner != self.owner {
+			continue
+		}
+		peers = append(peers, p)
+	}
+	return peers
+}
+
+// lacksTailscaleCLI reports whether a peer's OS ships no `tailscale` binary and so
+// cannot enumerate the tailnet on its own. Android (Termux) is the only such
+// platform, which is why the roster has to be pushed to it.
+func lacksTailscaleCLI(peerOS string) bool { return peerOS == "android" }
+
+// pushRoster hands each CLI-less peer this node's full tailnet view, so it can reach
+// every device without a manually supplied seed — the map flows to the phone instead
+// of the phone having to go find it. Only a CLI node's roster is authoritative, so
+// this no-ops from a CLI-less node (its rosterJSON is just its own cache), and the
+// roster (a `tailscale status` call) is built only when there is somewhere to send it.
 func pushRoster(devs []device) int {
 	if _, err := tailscaleBin(); err != nil {
 		return 0
@@ -448,17 +496,11 @@ func pushRoster(devs []device) int {
 		return 0
 	}
 	var targets []string
-	for _, p := range devs {
-		if p.self || !p.online || p.ip == "" || p.owner != self.owner {
-			continue
+	for _, p := range onlineOwnedPeers(devs, self) {
+		if lacksTailscaleCLI(p.os) {
+			targets = append(targets, p.ip)
 		}
-		if p.os != "android" {
-			continue // CLI-capable peers discover on their own
-		}
-		targets = append(targets, p.ip)
 	}
-	// Only build the roster (a `tailscale status` call) when there is somewhere to
-	// send it — nothing to do on a tailnet with no CLI-less peers.
 	if len(targets) == 0 {
 		return 0
 	}
@@ -495,10 +537,7 @@ func announceAll(devs []device) {
 	if !ok {
 		return
 	}
-	for _, p := range devs {
-		if p.self || !p.online || p.ip == "" || p.owner != self.owner {
-			continue
-		}
+	for _, p := range onlineOwnedPeers(devs, self) {
 		go postResync(p.ip)
 	}
 }
@@ -522,83 +561,100 @@ func writeAuthorizedKeys(pl Platform, body string) error {
 	return pl.SecureKeyFile(path)
 }
 
+// sshConfigPaths are the files a generated Host entry points ssh at.
+type sshConfigPaths struct {
+	// identity is this node's tailssh private key, used with IdentitiesOnly.
+	identity string
+	// managedKnownHosts holds the peer host keys tailssh pre-populated (see
+	// writeKnownHosts). It is read alongside userKnownHosts under accept-new, which
+	// keeps a peer whose host key we couldn't fetch reachable via first-connect trust.
+	managedKnownHosts string
+	// userKnownHosts is the user's own file, where ssh records newly accepted hosts.
+	userKnownHosts string
+}
+
+// peerUsesTailscaleSSH reports whether a peer should be reached over keyless
+// Tailscale SSH instead of the tailssh key mesh. The mesh wins whenever the peer runs
+// tailssh (we hold its key and its login user from /meta): it is self-contained and
+// needs no tailnet ACL. Tailscale SSH is the fallback only for Linux/macOS peers not
+// yet in the mesh — zero-install on them, at the cost of the ssh accept rule.
+func peerUsesTailscaleSSH(peerOS string, inMesh bool) bool {
+	return !inMesh && (peerOS == "linux" || peerOS == "macOS")
+}
+
+// sshConfigHostEntry renders one peer's "Host <name>" stanza. ok is false when the
+// peer can't be reached at all: an empty DNSName (which would emit a malformed
+// "Host " line), or a peer outside the mesh with no Tailscale SSH fallback
+// (Windows/Android). Tailscale SSH authenticates by tailnet identity, so those
+// entries carry no key, port or IdentityFile.
+func sshConfigHostEntry(p device, keyed map[string]cachedPeer, paths sshConfigPaths) (string, bool) {
+	if p.name == "" {
+		return "", false
+	}
+	c, inMesh := keyed[p.name]
+	useTailscaleSSH := peerUsesTailscaleSSH(p.os, inMesh)
+	if !inMesh && !useTailscaleSSH {
+		return "", false
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Host %s\n", p.name)
+	fmt.Fprintf(&b, "    HostName %s\n", p.name)
+	if inMesh && c.User != "" {
+		fmt.Fprintf(&b, "    User %s\n", sshConfigUser(c.User))
+	}
+	if useTailscaleSSH {
+		return b.String(), true
+	}
+
+	if port := sshPortFor(p.os, c.Port); port != 22 {
+		fmt.Fprintf(&b, "    Port %d\n", port)
+	}
+	fmt.Fprintf(&b, "    IdentityFile \"%s\"\n", paths.identity)
+	b.WriteString("    IdentitiesOnly yes\n")
+	if paths.managedKnownHosts != "" {
+		fmt.Fprintf(&b, "    UserKnownHostsFile \"%s\" \"%s\"\n", paths.userKnownHosts, paths.managedKnownHosts)
+		b.WriteString("    StrictHostKeyChecking accept-new\n")
+	}
+	return b.String(), true
+}
+
+// sshConfigManagedBlock renders the blank-line-separated Host stanzas for every
+// reachable peer.
+func sshConfigManagedBlock(owned []device, keyed map[string]cachedPeer, paths sshConfigPaths) string {
+	var entries []string
+	for _, p := range owned {
+		if entry, ok := sshConfigHostEntry(p, keyed, paths); ok {
+			entries = append(entries, entry)
+		}
+	}
+	return strings.Join(entries, "\n")
+}
+
 // writeSSHConfig generates the managed Host block for `ssh <name>`, choosing the
-// transport per peer: the tailssh key mesh whenever the peer runs tailssh (we hold
-// its key and its remote login user from /meta — reliable, no tailnet ACL needed),
-// falling back to keyless Tailscale SSH for Linux/macOS peers that are not yet in
-// the mesh (zero-install on them). User comes from /meta, so `ssh <name>` needs no
-// hand-entered username on any OS.
+// transport per peer (see peerUsesTailscaleSSH). User comes from /meta, so
+// `ssh <name>` needs no hand-entered username on any OS. A read failure that is not
+// "absent" (a permission/ACL problem, say) aborts: treating it as an empty file would
+// regenerate the config from the managed block alone and silently discard every Host
+// entry the user wrote by hand.
 func writeSSHConfig(owned []device, keyed map[string]cachedPeer) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
 	}
 	path := filepath.Join(home, ".ssh", "config")
-	keyPath := appKeyPath()
-	khPath, _ := knownHostsPath()
-	userKH := filepath.Join(home, ".ssh", "known_hosts")
+	managedKH, _ := knownHostsPath()
+	block := sshConfigManagedBlock(owned, keyed, sshConfigPaths{
+		identity:          appKeyPath(),
+		managedKnownHosts: managedKH,
+		userKnownHosts:    filepath.Join(home, ".ssh", "known_hosts"),
+	})
 
-	var b strings.Builder
-	written := 0
-	for _, p := range owned {
-		if p.name == "" {
-			continue // an empty DNSName would emit a malformed "Host " line
-		}
-		c, inMesh := keyed[p.name]
-		// Prefer the key mesh whenever the peer runs tailssh (we hold its key + the
-		// right login user from its /meta): it is self-contained and needs no tailnet
-		// ACL. Fall back to Tailscale SSH only for Linux/macOS peers NOT in the mesh —
-		// keyless and zero-install on them, at the cost of the ssh accept rule.
-		useTailscaleSSH := !inMesh && (p.os == "linux" || p.os == "macOS")
-		if !inMesh && !useTailscaleSSH {
-			continue // Windows/Android not in the mesh yet → nothing to reach it with
-		}
-		if written > 0 {
-			b.WriteString("\n")
-		}
-		written++
-		fmt.Fprintf(&b, "Host %s\n", p.name)
-		fmt.Fprintf(&b, "    HostName %s\n", p.name)
-		if inMesh && c.User != "" {
-			fmt.Fprintf(&b, "    User %s\n", sshConfigUser(c.User))
-		}
-
-		// Tailscale SSH authenticates by tailnet identity — no key/port/IdentityFile.
-		if useTailscaleSSH {
-			continue
-		}
-
-		// Key mesh — any in-mesh peer, regardless of OS.
-		port := c.Port
-		if port == 0 {
-			if p.os == "android" {
-				port = 8022
-			} else {
-				port = 22
-			}
-		}
-		if port != 22 {
-			fmt.Fprintf(&b, "    Port %d\n", port)
-		}
-		fmt.Fprintf(&b, "    IdentityFile \"%s\"\n", keyPath)
-		b.WriteString("    IdentitiesOnly yes\n")
-		// Verify the host against the key tailssh pre-populated (see writeKnownHosts),
-		// reading the user's file too and writing new hosts there. accept-new keeps
-		// peers we couldn't fetch a host key for reachable via first-connect trust.
-		if khPath != "" {
-			fmt.Fprintf(&b, "    UserKnownHostsFile \"%s\" \"%s\"\n", userKH, khPath)
-			b.WriteString("    StrictHostKeyChecking accept-new\n")
-		}
-	}
-
-	// A read failure that is not "absent" (a permission/ACL problem, say) must abort:
-	// treating it as an empty file would regenerate the config from the managed block
-	// alone and silently discard every Host entry the user wrote by hand.
 	existing, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read %s: %w (refusing to rewrite it — user Host entries would be lost)", path, err)
 	}
-	out := withManagedBlock(existing, strings.TrimRight(b.String(), "\n"))
+	out := withManagedBlock(existing, strings.TrimRight(block, "\n"))
 	if sameContent(path, out) {
 		return nil
 	}
@@ -655,7 +711,8 @@ func stripManagedBlock(content string) string {
 }
 
 // validEd25519Line reports whether line is a well-formed "ssh-ed25519 <b64>"
-// authorized_keys entry with a 32-byte key — validated with the stdlib alone.
+// authorized_keys entry with a 32-byte key — validated with the stdlib alone. The
+// decoded blob is SSH wire format: string(algorithm) followed by string(public key).
 func validEd25519Line(line string) bool {
 	f := strings.Fields(strings.TrimSpace(line))
 	if len(f) < 2 || f[0] != "ssh-ed25519" {
@@ -665,7 +722,6 @@ func validEd25519Line(line string) bool {
 	if err != nil {
 		return false
 	}
-	// SSH wire format: string(algorithm) then string(public key).
 	algo, rest, ok := sshWireString(blob)
 	if !ok || string(algo) != "ssh-ed25519" {
 		return false

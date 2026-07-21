@@ -23,6 +23,14 @@ func runStatus(pl Platform) error {
 	}
 	self, haveSelf := selfDevice(devs)
 
+	statusPrintLocalNode(pl, self, haveSelf)
+	statusPrintPeers(statusOwnedPeers(devs, self), loadPeers())
+	return nil
+}
+
+// statusPrintLocalNode prints this node's identity, SSH server state, keyserver
+// reachability, disk-encryption posture, and any persistence caveat.
+func statusPrintLocalNode(pl Platform, self device, haveSelf bool) {
 	if haveSelf {
 		fmt.Printf("  this node   : %s  (%s)\n", nameOr(self), self.ip)
 	}
@@ -37,8 +45,12 @@ func runStatus(pl Platform) error {
 	if note := persistenceNote(); note != "" {
 		fmt.Printf("  persistence : %s\n", note)
 	}
+}
 
-	cache := loadPeers()
+// statusOwnedPeers returns the addressable, same-owner peers of self sorted by
+// name — the nodes `ssh <name>` could plausibly reach. Peers owned by someone
+// else are excluded only when self's owner is known.
+func statusOwnedPeers(devs []device, self device) []device {
 	var peers []device
 	for _, d := range devs {
 		if d.self || d.ip == "" || (self.owner != "" && d.owner != self.owner) {
@@ -47,28 +59,45 @@ func runStatus(pl Platform) error {
 		peers = append(peers, d)
 	}
 	sort.Slice(peers, func(i, j int) bool { return peers[i].name < peers[j].name })
+	return peers
+}
 
+// statusPrintPeers prints one reachability row per peer: online state, how we
+// reach it, and whether it is currently serving its key.
+func statusPrintPeers(peers []device, cache map[string]cachedPeer) {
 	fmt.Printf("\n  peers (%d):\n", len(peers))
 	for _, p := range peers {
-		state := "offline"
-		if p.online {
-			state = "online"
-		}
 		_, keyed := cache[p.name]
-		reach := "unreachable"
-		switch {
-		case keyed:
-			reach = "key mesh"
-		case p.os == "linux" || p.os == "macOS":
-			reach = "tailscale-ssh"
-		}
-		serving := ""
-		if p.online && inMesh(p.ip) {
-			serving = "serving"
-		}
-		fmt.Printf("    %-18s %-8s %-14s %-8s ssh %s\n", nameOr(p), state, reach, serving, nameOr(p))
+		fmt.Printf("    %-18s %-8s %-14s %-8s ssh %s\n",
+			nameOr(p), statusPeerState(p), statusPeerReach(p, keyed), statusPeerServing(p), nameOr(p))
 	}
-	return nil
+}
+
+func statusPeerState(p device) string {
+	if p.online {
+		return "online"
+	}
+	return "offline"
+}
+
+// statusPeerReach names the transport `ssh <name>` would use: the key mesh once a
+// peer's key is cached, tailscale-ssh for Linux/macOS peers we haven't keyed, and
+// unreachable otherwise (e.g. Windows without a cached key).
+func statusPeerReach(p device, keyed bool) string {
+	switch {
+	case keyed:
+		return "key mesh"
+	case p.os == "linux" || p.os == "macOS":
+		return "tailscale-ssh"
+	}
+	return "unreachable"
+}
+
+func statusPeerServing(p device) string {
+	if p.online && inMesh(p.ip) {
+		return "serving"
+	}
+	return ""
 }
 
 // keyserverUp reports whether this node's own keyserver answers on its tailnet IP.

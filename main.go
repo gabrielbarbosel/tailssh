@@ -66,9 +66,7 @@ func tailscaleBin() (string, error) {
 			cachedBin = p
 			return p, nil
 		}
-		// Only stat explicit paths. A bare name like "tailscale" would resolve
-		// against the cwd and shadow the real absolute install locations.
-		if strings.ContainsRune(c, filepath.Separator) || strings.ContainsRune(c, '/') {
+		if isExplicitPath(c) {
 			if _, err := os.Stat(c); err == nil {
 				cachedBin = c
 				return c, nil
@@ -76,6 +74,14 @@ func tailscaleBin() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("tailscale CLI not found (is Tailscale installed and running?)")
+}
+
+// isExplicitPath reports whether a candidate names a filesystem location rather
+// than a bare command. Only explicit paths may be stat'd: os.Stat of a bare name
+// like "tailscale" would match a file in the cwd and shadow the real absolute
+// install locations, so bare names are resolved through PATH (LookPath) alone.
+func isExplicitPath(candidate string) bool {
+	return strings.ContainsRune(candidate, filepath.Separator) || strings.ContainsRune(candidate, '/')
 }
 
 // discover returns the tailnet members. On hosts with the tailscale CLI it reads
@@ -217,6 +223,20 @@ func fail(err error) {
 	os.Exit(1)
 }
 
+// runSyncCommand runs a manual sync. Because it writes the same system-wide files
+// provisioning does, it self-elevates on a Windows admin account before syncing —
+// the daemon's own syncs already run elevated via its scheduled task. When the
+// call was handled by re-launching elevated, it returns without syncing here.
+// EnsurePrivilege is a no-op on the other platforms.
+func runSyncCommand(pl Platform) error {
+	if handled, err := pl.EnsurePrivilege(os.Args[1:]); err != nil {
+		return err
+	} else if handled {
+		return nil
+	}
+	return runSync(pl)
+}
+
 func main() {
 	cmd := "list"
 	if len(os.Args) > 1 {
@@ -244,16 +264,7 @@ func main() {
 			fail(err)
 		}
 	case "sync":
-		pl := selectPlatform()
-		// A manual sync writes the same system-wide files provisioning does, so it
-		// self-elevates on a Windows admin account (the daemon's own syncs already
-		// run elevated via its task). No-op elsewhere.
-		if handled, err := pl.EnsurePrivilege(os.Args[1:]); err != nil {
-			fail(err)
-		} else if handled {
-			return
-		}
-		if err := runSync(pl); err != nil {
+		if err := runSyncCommand(selectPlatform()); err != nil {
 			fail(err)
 		}
 	case "daemon":

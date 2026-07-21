@@ -81,20 +81,27 @@ func (darwinPlatform) SSHState() (installed, running bool) {
 // InstallSSH is a no-op: OpenSSH server is part of the base system.
 func (darwinPlatform) InstallSSH() error { return nil }
 
-// EnableSSH turns on Remote Login. It first tries the launchd path (enable +
-// bootstrap the system sshd job); if that fails it falls back to the classic
-// systemsetup toggle. Both need root, so run acquires sudo when needed.
-func (p darwinPlatform) EnableSSH() error {
-	// Preferred: launchd. enable persists the job across reboots; bootstrap
-	// starts it now. bootstrap may report "already bootstrapped" — harmless.
-	if err := p.run("launchctl", "enable", "system/com.openssh.sshd"); err == nil {
-		_ = p.run("launchctl", "bootstrap", "system",
-			"/System/Library/LaunchDaemons/ssh.plist")
-		if _, running := p.SSHState(); running {
-			return nil
-		}
+// enableSSHViaLaunchd enables the system sshd job persistently and starts it for
+// the current boot, reporting whether sshd came up. enable persists the job
+// across reboots; bootstrap starts it now and may report "already bootstrapped",
+// which is harmless.
+func (p darwinPlatform) enableSSHViaLaunchd() bool {
+	if err := p.run("launchctl", "enable", "system/com.openssh.sshd"); err != nil {
+		return false
 	}
-	// Fallback: the user-facing Remote Login switch (FDA-gated on newer macOS).
+	_ = p.run("launchctl", "bootstrap", "system",
+		"/System/Library/LaunchDaemons/ssh.plist")
+	_, running := p.SSHState()
+	return running
+}
+
+// EnableSSH turns on Remote Login, preferring the launchd path and falling back
+// to the user-facing systemsetup toggle (FDA-gated on newer macOS). Both need
+// root, so run acquires sudo when needed.
+func (p darwinPlatform) EnableSSH() error {
+	if p.enableSSHViaLaunchd() {
+		return nil
+	}
 	if err := p.run("systemsetup", "-setremotelogin", "on"); err != nil {
 		return fmt.Errorf("enable Remote Login: %w", err)
 	}
@@ -153,16 +160,19 @@ func sshHostKeyPubPath() string {
 // and privileged steps escalate per command via sudo, so no re-launch is needed.
 func (p darwinPlatform) EnsurePrivilege([]string) (bool, error) { return false, nil }
 
-// InstallDaemon writes a per-user LaunchAgent plist and loads it. Running as the
-// logged-in user keeps authorized_keys owned correctly and avoids root/TCC. The
-// PATH is widened so the Tailscale.app CLI is discoverable from the agent.
-func (p darwinPlatform) InstallDaemon(exePath string) error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	plistPath := filepath.Join(home, "Library", "LaunchAgents", darwinDaemonLabel+".plist")
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+// darwinDaemonDomainTarget returns the launchctl per-user domain (user/<uid>).
+// This domain is present without a GUI (Aqua) login session; the gui/<uid>
+// domain only exists for a logged-in window-server session and would fail over
+// SSH on a headless Mac.
+func darwinDaemonDomainTarget() string {
+	return "user/" + strconv.Itoa(os.Getuid())
+}
+
+// darwinDaemonPlist renders the LaunchAgent property list for the daemon. The
+// PATH is widened beyond the launchd default so the Tailscale.app CLI is
+// discoverable from the agent.
+func darwinDaemonPlist(exePath string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -187,30 +197,50 @@ func (p darwinPlatform) InstallDaemon(exePath string) error {
 </dict>
 </plist>
 `, darwinDaemonLabel, xmlEscaper.Replace(exePath))
+}
 
-	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
-		return err
-	}
-
-	// Load into the per-user domain (user/<uid>), which is present without a GUI
-	// (Aqua) login session — the gui/<uid> domain only exists for a logged-in
-	// window-server session, so it would fail over SSH on a headless Mac.
-	target := "user/" + strconv.Itoa(os.Getuid())
+// darwinBootstrapLaunchAgent loads the agent into target, tearing down any
+// existing instance first so a reinstall doesn't fail with "service already
+// bootstrapped". It prefers the modern bootstrap verb and falls back to the
+// legacy load verb on older launchctl. Only the final load's failure is
+// returned; the preceding teardown is best-effort.
+func darwinBootstrapLaunchAgent(target, plistPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	// Idempotent: tear down any existing instance before bootstrapping, so a
-	// reinstall doesn't fail with "service already bootstrapped". Best-effort.
 	_ = exec.CommandContext(ctx, "launchctl", "bootout", target+"/"+darwinDaemonLabel).Run()
-	// Prefer bootstrap; fall back to the legacy load verb on older launchctl.
 	if err := exec.CommandContext(ctx, "launchctl", "bootstrap", target, plistPath).Run(); err != nil {
 		if err := exec.CommandContext(ctx, "launchctl", "load", "-w", plistPath).Run(); err != nil {
 			return fmt.Errorf("launchctl load %s: %w", plistPath, err)
 		}
 	}
 	return nil
+}
+
+// darwinUnloadLaunchAgent unloads the agent from target, preferring the modern
+// bootout verb and falling back to the legacy unload verb. Both are best-effort.
+func darwinUnloadLaunchAgent(target, plistPath string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "launchctl", "bootout", target).Run(); err != nil {
+		_ = exec.CommandContext(ctx, "launchctl", "unload", "-w", plistPath).Run()
+	}
+}
+
+// InstallDaemon writes a per-user LaunchAgent plist and loads it. Running as the
+// logged-in user keeps authorized_keys owned correctly and avoids root/TCC.
+func (p darwinPlatform) InstallDaemon(exePath string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", darwinDaemonLabel+".plist")
+	if err := os.MkdirAll(filepath.Dir(plistPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(plistPath, []byte(darwinDaemonPlist(exePath)), 0o644); err != nil {
+		return err
+	}
+	return darwinBootstrapLaunchAgent(darwinDaemonDomainTarget(), plistPath)
 }
 
 // RemoveDaemon unloads the LaunchAgent and deletes its plist.
@@ -220,14 +250,7 @@ func (p darwinPlatform) RemoveDaemon() error {
 		return err
 	}
 	plistPath := filepath.Join(home, "Library", "LaunchAgents", darwinDaemonLabel+".plist")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	target := "user/" + strconv.Itoa(os.Getuid()) + "/" + darwinDaemonLabel
-	// bootout is the modern unload; fall back to legacy unload. Both best-effort.
-	if err := exec.CommandContext(ctx, "launchctl", "bootout", target).Run(); err != nil {
-		_ = exec.CommandContext(ctx, "launchctl", "unload", "-w", plistPath).Run()
-	}
+	darwinUnloadLaunchAgent(darwinDaemonDomainTarget()+"/"+darwinDaemonLabel, plistPath)
 	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}

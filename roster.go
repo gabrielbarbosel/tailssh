@@ -1,16 +1,5 @@
 package main
 
-// roster.go — CLI-less discovery for Android/Termux.
-//
-// The Tailscale Android app never exposes the `tailscale` CLI or LocalAPI to
-// Termux, so `tailscale status` is unavailable there. Instead a CLI-less node:
-//   - learns its OWN tailnet IP by scanning local interfaces for the Tailscale
-//     CGNAT range (100.64.0.0/10) — pure stdlib, no CLI, and
-//   - learns its PEERS by fetching /roster from a seed peer that DOES have the
-//     CLI (any desktop running the daemon serves its `tailscale status` there).
-//
-// Seeds come from the persisted peer cache plus $TAILSSH_SEED for the first run.
-
 import (
 	"context"
 	"encoding/json"
@@ -123,10 +112,11 @@ func seedIPs() []string {
 	return ips
 }
 
-// discoverCLIless is the discovery path for a node with no tailscale CLI. It
-// prefers the roster a CLI peer has pushed to us (the complete, current map, so
-// no seed is ever needed), and only falls back to pulling /roster from a seed if
-// nothing has been pushed yet.
+// discoverCLIless is the discovery path for a node with no tailscale CLI — the
+// Tailscale Android app never exposes the CLI or LocalAPI to Termux, so
+// `tailscale status` is unavailable there. It prefers the roster a CLI peer has
+// pushed to us (the complete, current map, so no seed is ever needed), and only
+// falls back to pulling /roster from a seed if nothing has been pushed yet.
 func discoverCLIless() ([]device, error) {
 	if wires := loadRosterCache(); len(wires) > 0 {
 		return devicesFromWires(wires), nil

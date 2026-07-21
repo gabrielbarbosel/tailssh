@@ -1,13 +1,5 @@
 package main
 
-// fleet.go — self-propagation using ONLY tailssh + native Tailscale features
-// (no Tailscale SSH). A seed node (any host with the tailscale CLI) finds every
-// same-owner peer not yet in the mesh and pushes the installer to it with Taildrop
-// (`tailscale file cp`); the peer's Tailscale app raises a notification and the
-// user taps to run it. That one tap is unavoidable — without Tailscale SSH there
-// is no native way to EXECUTE on a remote device; Taildrop only DELIVERS.
-// Once a device runs the installer it joins the mesh and syncs keys natively.
-
 import (
 	"context"
 	"fmt"
@@ -37,6 +29,13 @@ func download(url string, limit int64) ([]byte, error) {
 
 const releaseBase = "https://github.com/gabrielbarbosel/tailssh/releases/latest/download"
 
+// maxInstallerBytes caps the installer download so a hostile or misconfigured
+// release cannot exhaust memory; the real binary is a few MiB.
+const maxInstallerBytes = 64 << 20
+
+// onboardInterval is the minimum delay between onboarding attempts for a peer.
+const onboardInterval = 15 * time.Minute
+
 // onboardState rate-limits onboarding attempts so a peer is not spammed.
 type onboardState struct {
 	mu   sync.Mutex
@@ -64,8 +63,15 @@ func inMesh(ip string) bool {
 	return err == nil
 }
 
-// fleetSweep runs one onboarding pass. Only a node with the tailscale CLI can
-// seed; CLI-less nodes (Android) return immediately.
+// fleetOnboardable reports whether p is an online, same-owner peer eligible for
+// onboarding (excludes self and peers without a tailnet IP).
+func fleetOnboardable(p, self device) bool {
+	return !p.self && p.online && p.ip != "" && p.owner == self.owner
+}
+
+// fleetSweep runs one onboarding pass, seeding every eligible same-owner peer not
+// yet in the mesh via Taildrop (native Tailscale, no Tailscale SSH). Only a node
+// with the tailscale CLI can seed; CLI-less nodes (Android) return immediately.
 func fleetSweep(state *onboardState) {
 	bin, err := tailscaleBin()
 	if err != nil {
@@ -81,16 +87,15 @@ func fleetSweep(state *onboardState) {
 	}
 	var wg sync.WaitGroup
 	for _, p := range devs {
-		if p.self || !p.online || p.ip == "" || p.owner != self.owner {
+		if !fleetOnboardable(p, self) {
 			continue
 		}
 		if inMesh(p.ip) {
 			continue
 		}
-		if !state.due(p.name, 15*time.Minute) {
+		if !state.due(p.name, onboardInterval) {
 			continue
 		}
-		p := p
 		wg.Add(1)
 		go func() { defer wg.Done(); onboardViaTaildrop(bin, p) }()
 	}
@@ -98,10 +103,12 @@ func fleetSweep(state *onboardState) {
 }
 
 // onboardViaTaildrop downloads the installer for the peer's OS and pushes it with
-// Taildrop; the peer's Tailscale app shows a notification to run it (one tap).
+// Taildrop. Taildrop only DELIVERS — without Tailscale SSH there is no native way
+// to EXECUTE remotely — so the peer's user taps the Tailscale notification once to
+// run it, after which the device joins the mesh and syncs keys natively.
 func onboardViaTaildrop(bin string, p device) {
 	url, name := installerFor(p.os)
-	body, err := download(url, 64<<20)
+	body, err := download(url, maxInstallerBytes)
 	if err != nil {
 		fmt.Printf("fleet: download for %s failed: %v\n", p.name, err)
 		return

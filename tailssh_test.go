@@ -36,25 +36,27 @@ func TestSSHConfigUser(t *testing.T) {
 
 func TestManagedBlockRoundTrip(t *testing.T) {
 	user := "Host keep\n    HostName 1.2.3.4\n"
-	// A fresh block appends to preserved user content.
 	out := string(withManagedBlock([]byte(user), "Host peer\n    HostName peer"))
-	if !strings.Contains(out, "Host keep") {
-		t.Fatal("user content not preserved")
-	}
-	if !strings.Contains(out, managedBegin) || !strings.Contains(out, managedEnd) {
-		t.Fatal("managed markers missing")
-	}
-	// Re-applying replaces only the managed region, never duplicating user content.
+	t.Run("fresh block appends to preserved user content", func(t *testing.T) {
+		if !strings.Contains(out, "Host keep") {
+			t.Fatal("user content not preserved")
+		}
+		if !strings.Contains(out, managedBegin) || !strings.Contains(out, managedEnd) {
+			t.Fatal("managed markers missing")
+		}
+	})
 	out2 := string(withManagedBlock([]byte(out), "Host peer2\n    HostName peer2"))
-	if strings.Count(out2, "Host keep") != 1 {
-		t.Errorf("user content duplicated: %q", out2)
-	}
-	if strings.Contains(out2, "Host peer\n") {
-		t.Error("old managed content leaked into the rewrite")
-	}
-	if strings.TrimSpace(stripManagedBlock(out2)) != strings.TrimSpace(user) {
-		t.Errorf("stripManagedBlock did not recover user content: %q", stripManagedBlock(out2))
-	}
+	t.Run("re-applying rewrites only the managed region without duplicating user content", func(t *testing.T) {
+		if strings.Count(out2, "Host keep") != 1 {
+			t.Errorf("user content duplicated: %q", out2)
+		}
+		if strings.Contains(out2, "Host peer\n") {
+			t.Error("old managed content leaked into the rewrite")
+		}
+		if strings.TrimSpace(stripManagedBlock(out2)) != strings.TrimSpace(user) {
+			t.Errorf("stripManagedBlock did not recover user content: %q", stripManagedBlock(out2))
+		}
+	})
 }
 
 func TestHostPattern(t *testing.T) {
@@ -76,21 +78,23 @@ func TestHostPattern(t *testing.T) {
 }
 
 func TestEnsureSSHRule(t *testing.T) {
-	// An existing accept rule is left untouched.
-	with := `{"ssh": [{"action": "accept", "src": ["autogroup:member"]}]}`
-	if _, changed := ensureSSHRule(with); changed {
-		t.Error("ensureSSHRule modified a policy that already had an accept rule")
-	}
-	// A policy without one gains exactly the rule, preserving existing content.
-	without := "{\n\t// keep this comment\n\t\"acls\": [{\"action\": \"accept\"}],\n\t\"ssh\": [],\n}"
-	got, changed := ensureSSHRule(without)
-	if !changed {
-		t.Fatal("ensureSSHRule did not add a rule to a policy missing one")
-	}
-	if !strings.Contains(got, "keep this comment") || !strings.Contains(got, `"acls"`) {
-		t.Error("ensureSSHRule dropped existing policy content")
-	}
-	if !sshHasAccept(got) {
-		t.Error("ensureSSHRule output has no accept rule")
-	}
+	t.Run("existing accept rule is left untouched", func(t *testing.T) {
+		with := `{"ssh": [{"action": "accept", "src": ["autogroup:member"]}]}`
+		if _, changed := ensureSSHRule(with); changed {
+			t.Error("ensureSSHRule modified a policy that already had an accept rule")
+		}
+	})
+	t.Run("policy missing a rule gains exactly one, preserving existing content", func(t *testing.T) {
+		without := "{\n\t// keep this comment\n\t\"acls\": [{\"action\": \"accept\"}],\n\t\"ssh\": [],\n}"
+		got, changed := ensureSSHRule(without)
+		if !changed {
+			t.Fatal("ensureSSHRule did not add a rule to a policy missing one")
+		}
+		if !strings.Contains(got, "keep this comment") || !strings.Contains(got, `"acls"`) {
+			t.Error("ensureSSHRule dropped existing policy content")
+		}
+		if !sshHasAccept(got) {
+			t.Error("ensureSSHRule output has no accept rule")
+		}
+	})
 }

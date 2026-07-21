@@ -23,6 +23,13 @@ var httpClient = &http.Client{
 	},
 }
 
+// drainAndCloseBody reads and discards up to limit bytes of body before closing
+// it, so the underlying keep-alive connection can be reused instead of dropped.
+func drainAndCloseBody(body io.ReadCloser, limit int64) {
+	io.Copy(io.Discard, io.LimitReader(body, limit))
+	body.Close()
+}
+
 // getBounded GETs url with the shared client and reads at most limit bytes.
 func getBounded(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -33,10 +40,7 @@ func getBounded(ctx context.Context, url string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, limit)) // drain to reuse conn
-		resp.Body.Close()
-	}()
+	defer drainAndCloseBody(resp.Body, limit)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("http %d", resp.StatusCode)
 	}
@@ -53,6 +57,32 @@ func backoff(n int, base, max time.Duration) time.Duration {
 	return time.Duration(rand.Int63n(int64(d) + 1))
 }
 
+// atomicWriteTempPattern is the CreateTemp pattern for atomicWrite's in-flight temp
+// files; the ".tailssh-" prefix also identifies stale temps to prune.
+const atomicWriteTempPattern = ".tailssh-*"
+
+// staleTempAge is how old an atomicWrite temp must be before pruneStaleTempFiles
+// removes it. It must exceed the longest plausible in-flight write so a concurrent
+// writer's temp is never mistaken for abandoned: two atomicWrites can target the
+// same dir (e.g. peers.json written by a sync while roster.json is written by an
+// incoming push).
+const staleTempAge = 5 * time.Minute
+
+// pruneStaleTempFiles best-effort removes atomicWrite temp files left behind by an
+// ungraceful kill, skipping any young enough to still be a concurrent writer's
+// in-flight temp.
+func pruneStaleTempFiles(dir string) {
+	stale, err := filepath.Glob(filepath.Join(dir, atomicWriteTempPattern))
+	if err != nil {
+		return
+	}
+	for _, f := range stale {
+		if fi, statErr := os.Stat(f); statErr == nil && time.Since(fi.ModTime()) > staleTempAge {
+			os.Remove(f)
+		}
+	}
+}
+
 // atomicWrite writes data to path via a temp file + fsync + rename, then applies perm.
 // The rename is atomic, so readers never see a partial file.
 func atomicWrite(path string, data []byte, perm os.FileMode) error {
@@ -60,23 +90,13 @@ func atomicWrite(path string, data []byte, perm os.FileMode) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	// Best-effort cleanup of temp files left behind by an ungraceful kill. Only
-	// remove ones old enough that they can't be a concurrent writer's in-flight
-	// temp — two atomicWrites can target the same dir (e.g. peers.json written by
-	// a sync while roster.json is written by an incoming push).
-	if stale, err := filepath.Glob(filepath.Join(dir, ".tailssh-*")); err == nil {
-		for _, f := range stale {
-			if fi, statErr := os.Stat(f); statErr == nil && time.Since(fi.ModTime()) > 5*time.Minute {
-				os.Remove(f)
-			}
-		}
-	}
-	tmp, err := os.CreateTemp(dir, ".tailssh-*")
+	pruneStaleTempFiles(dir)
+	tmp, err := os.CreateTemp(dir, atomicWriteTempPattern)
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
-	defer os.Remove(name) // no-op after a successful rename
+	defer os.Remove(name)
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return err

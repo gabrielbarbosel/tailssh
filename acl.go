@@ -79,10 +79,14 @@ func ensureSSHRule(s string) (string, bool) {
 	return s, false
 }
 
-// runACL ensures the ssh accept rule exists. quiet suppresses the "already there"
-// / guidance chatter (used by the opportunistic call from `up`).
+// runACL ensures the `ssh accept` rule exists with progress reporting; it is the
+// CLI entry point (`up` calls applyACL directly with quiet set).
 func runACL(apply bool) error { return applyACL(apply, false) }
 
+// applyACL ensures the tailnet policy contains an `ssh accept` rule, editing the
+// HuJSON in place. apply performs the write; without it the missing/present state
+// is only reported. quiet suppresses that report chatter for the opportunistic
+// call from `up`, including the case where TS_API_KEY is absent.
 func applyACL(apply, quiet bool) error {
 	token := os.Getenv("TS_API_KEY")
 	if token == "" {
@@ -93,22 +97,12 @@ func applyACL(apply, quiet bool) error {
 	}
 	client := &http.Client{Timeout: 20 * time.Second}
 
-	// GET the policy as HuJSON (comments + formatting preserved).
-	req, _ := http.NewRequest(http.MethodGet, aclURL, nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/hujson")
-	resp, err := client.Do(req)
+	policy, etag, err := aclFetchPolicy(client, token)
 	if err != nil {
 		return err
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	etag := resp.Header.Get("ETag")
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("acl GET failed (%d): %s", resp.StatusCode, string(body))
-	}
 
-	updated, changed := ensureSSHRule(string(body))
+	updated, changed := ensureSSHRule(policy)
 	if !changed {
 		if !quiet {
 			fmt.Println("acl: an `ssh accept` rule is already present — Tailscale SSH is seamless.")
@@ -121,21 +115,51 @@ func applyACL(apply, quiet bool) error {
 		return nil
 	}
 
-	preq, _ := http.NewRequest(http.MethodPost, aclURL, bytes.NewReader([]byte(updated)))
-	preq.Header.Set("Authorization", "Bearer "+token)
-	preq.Header.Set("Content-Type", "application/hujson")
-	if etag != "" {
-		preq.Header.Set("If-Match", etag) // optimistic concurrency
+	if err := aclPostPolicy(client, token, updated, etag); err != nil {
+		return err
 	}
-	presp, err := client.Do(preq)
+	fmt.Println("acl: `ssh accept` rule added (rest of the policy preserved) — Tailscale SSH seamless in all directions.")
+	return nil
+}
+
+// aclFetchPolicy GETs the tailnet policy as HuJSON — the Accept header keeps
+// comments and formatting intact so the rule can be inserted surgically. It also
+// returns the ETag, which the write path replays as If-Match.
+func aclFetchPolicy(client *http.Client, token string) (policy, etag string, err error) {
+	req, _ := http.NewRequest(http.MethodGet, aclURL, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/hujson")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	etag = resp.Header.Get("ETag")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("acl GET failed (%d): %s", resp.StatusCode, string(body))
+	}
+	return string(body), etag, nil
+}
+
+// aclPostPolicy writes the edited policy back. The ETag is sent as If-Match for
+// optimistic concurrency, so a policy changed by someone else in the meantime is
+// rejected rather than clobbered.
+func aclPostPolicy(client *http.Client, token, policy, etag string) error {
+	req, _ := http.NewRequest(http.MethodPost, aclURL, bytes.NewReader([]byte(policy)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/hujson")
+	if etag != "" {
+		req.Header.Set("If-Match", etag)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-	pbody, _ := io.ReadAll(io.LimitReader(presp.Body, 1<<20))
-	presp.Body.Close()
-	if presp.StatusCode != http.StatusOK {
-		return fmt.Errorf("acl POST failed (%d): %s", presp.StatusCode, string(pbody))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("acl POST failed (%d): %s", resp.StatusCode, string(body))
 	}
-	fmt.Println("acl: `ssh accept` rule added (rest of the policy preserved) — Tailscale SSH seamless in all directions.")
 	return nil
 }

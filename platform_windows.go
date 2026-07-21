@@ -15,6 +15,10 @@ import (
 
 const windowsSvcName = "tailssh"
 
+// windowsAdministratorsSID is the locale-independent well-known SID of the local
+// Administrators group.
+const windowsAdministratorsSID = "S-1-5-32-544"
+
 // windowsPlatform implements Platform for Windows using PowerShell (service +
 // capability + firewall control) and icacls (ACL hardening).
 //
@@ -84,7 +88,7 @@ func windowsIsElevated() bool {
 func windowsInAdminGroup() bool {
 	out, err := windowsPowershell(
 		"$me=([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value;" +
-			"try{((Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop|" +
+			"try{((Get-LocalGroupMember -SID '" + windowsAdministratorsSID + "' -ErrorAction Stop|" +
 			"Where-Object{$_.SID.Value -eq $me}|Measure-Object).Count -gt 0)}" +
 			"catch{([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent())" +
 			".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)}")
@@ -100,6 +104,11 @@ func (windowsPlatform) SSHState() (installed, running bool) {
 	return s != "", strings.EqualFold(s, "Running")
 }
 
+// windowsTailnetCGNATRange is the Tailscale CGNAT address range; scoping the sshd
+// firewall rule to it keeps the server reachable only over the tailnet, never from
+// public networks.
+const windowsTailnetCGNATRange = "100.64.0.0/10"
+
 // InstallSSH installs the OpenSSH server capability and opens the firewall for
 // inbound TCP 22. Both steps are idempotent. Host keys come from the capability,
 // so no ssh-keygen is needed here.
@@ -108,14 +117,18 @@ func (windowsPlatform) InstallSSH() error {
 		"Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"); err != nil {
 		return fmt.Errorf("add OpenSSH.Server capability: %w", err)
 	}
-	// RemoteAddress scopes the rule to the Tailscale CGNAT range (100.64.0.0/10)
-	// so sshd is reachable only over the tailnet, never from public networks.
+	windowsOpenTailnetFirewall()
+	return nil
+}
+
+// windowsOpenTailnetFirewall adds an idempotent inbound rule allowing TCP 22 only
+// from the tailnet CGNAT range, so sshd is never exposed to public networks.
+func windowsOpenTailnetFirewall() {
 	_, _ = windowsPowershell(
 		"if (-not (Get-NetFirewallRule -Name 'tailssh-sshd' -ErrorAction SilentlyContinue)) {" +
 			" New-NetFirewallRule -Name 'tailssh-sshd' -DisplayName 'tailssh OpenSSH Server'" +
 			" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22" +
-			" -RemoteAddress 100.64.0.0/10 }")
-	return nil
+			" -RemoteAddress " + windowsTailnetCGNATRange + " }")
 }
 
 // EnableSSH sets sshd to start automatically and starts it now. Idempotent.
@@ -203,18 +216,9 @@ func (p windowsPlatform) AuthorizedKeysPath() (string, error) {
 func (p windowsPlatform) SecureKeyFile(path string) error {
 	grants := []string{"/grant", "SYSTEM:F"}
 	if path == windowsAdminKeysPath() {
-		// Administrators well-known SID S-1-5-32-544.
-		grants = append(grants, "/grant", "*S-1-5-32-544:F")
+		grants = append(grants, "/grant", "*"+windowsAdministratorsSID+":F")
 	} else {
-		// Grant by SID, never by name: name principals are locale-dependent and
-		// unmappable on workgroup machines, where USERDOMAIN is the workgroup —
-		// not a security authority (icacls error 1332). os/user resolves the
-		// current account's SID directly.
-		if u, uerr := user.Current(); uerr == nil && u.Uid != "" {
-			grants = append(grants, "/grant", "*"+u.Uid+":F")
-		} else if name := os.Getenv("USERNAME"); name != "" {
-			grants = append(grants, "/grant", name+":F")
-		}
+		grants = append(grants, windowsPerUserKeyGrant()...)
 	}
 	args := append([]string{path}, grants...)
 	if out, err := exec.Command("icacls", args...).CombinedOutput(); err != nil {
@@ -224,6 +228,22 @@ func (p windowsPlatform) SecureKeyFile(path string) error {
 		return fmt.Errorf("icacls inheritance: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return verifyReadable(path)
+}
+
+// windowsPerUserKeyGrant returns the icacls "/grant <principal>:F" pair for the
+// current account. It grants by SID, never by name: name principals are
+// locale-dependent and unmappable on workgroup machines, where USERDOMAIN is the
+// workgroup rather than a security authority (icacls error 1332). os/user resolves
+// the account SID directly; only when that fails does it fall back to the USERNAME
+// principal, and to no grant at all when neither is available.
+func windowsPerUserKeyGrant() []string {
+	if u, err := user.Current(); err == nil && u.Uid != "" {
+		return []string{"/grant", "*" + u.Uid + ":F"}
+	}
+	if name := os.Getenv("USERNAME"); name != "" {
+		return []string{"/grant", name + ":F"}
+	}
+	return nil
 }
 
 // verifyReadable confirms the ACL just applied still lets this process open the
@@ -365,10 +385,20 @@ func sshHostKeyPubPath() string {
 // below allows battery start/continue, removes the time limit, and auto-restarts
 // the daemon if it crashes.
 func (p windowsPlatform) InstallDaemon(exePath string) error {
+	out, err := windowsPowershell(windowsDaemonTaskScript(exePath))
+	if err == nil {
+		return nil
+	}
+	return p.installDaemonFallback(exePath, err, out)
+}
+
+// windowsDaemonTaskScript builds the PowerShell that idempotently registers (via
+// -Force, which overwrites any existing task) and starts the tailssh daemon
+// scheduled task. RunLevel Highest requires elevation, so running the script
+// succeeds only from an elevated process.
+func windowsDaemonTaskScript(exePath string) string {
 	psq := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
-	// -Force overwrites any existing task, making install idempotent. RunLevel
-	// Highest needs elevation, so this path succeeds only when running as admin.
-	script := "$ErrorActionPreference='Stop';" +
+	return "$ErrorActionPreference='Stop';" +
 		"$a=New-ScheduledTaskAction -Execute '" + psq(exePath) + "' -Argument 'daemon';" +
 		"$t=New-ScheduledTaskTrigger -AtLogOn;" +
 		"$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries" +
@@ -379,27 +409,28 @@ func (p windowsPlatform) InstallDaemon(exePath string) error {
 		"Register-ScheduledTask -TaskName '" + windowsSvcName + "' -Action $a -Trigger $t" +
 		" -Settings $s -Principal $p -Force | Out-Null;" +
 		"Start-ScheduledTask -TaskName '" + windowsSvcName + "'"
-	out, err := windowsPowershell(script)
-	if err == nil {
-		return nil
-	}
-	// The elevated task couldn't be created (this process isn't elevated). On an
-	// Administrators account the daemon MUST run elevated — only then can it write
-	// and ACL administrators_authorized_keys, the sole file sshd reads for admins.
-	// The unprivileged run-key fallback would run the daemon unelevated and it would
-	// authorize peers into the per-user file sshd ignores, silently breaking inbound
-	// key auth. Fail fast with a clear pointer instead of installing that trap.
+}
+
+// installDaemonFallback handles a failed scheduled-task registration (the elevated
+// task couldn't be created because this process isn't elevated).
+//
+// On an Administrators account the daemon MUST run elevated — only then can it write
+// and ACL administrators_authorized_keys, the sole file sshd reads for admins. The
+// unprivileged run-key fallback would run the daemon unelevated and authorize peers
+// into the per-user file sshd ignores, silently breaking inbound key auth, so this
+// fails fast with a pointer to re-run elevated instead of installing that trap. A
+// standard (non-admin) account is the opposite case: its unprivileged run-key daemon
+// correctly manages the per-user authorized_keys that sshd actually reads there.
+func (p windowsPlatform) installDaemonFallback(exePath string, taskErr error, taskOut string) error {
 	if p.adminGroup {
 		return fmt.Errorf("daemon must run elevated on an Administrators account so it can "+
 			"manage %s (the only keys file sshd reads for admins) — re-run install from an "+
 			"elevated shell: register task: %v: %s",
-			windowsAdminKeysPath(), err, strings.TrimSpace(out))
+			windowsAdminKeysPath(), taskErr, strings.TrimSpace(taskOut))
 	}
-	// Standard (non-admin) account: the unprivileged run-key daemon is correct — it
-	// manages the per-user authorized_keys, which is exactly what sshd reads there.
 	if rerr := installRunKey(exePath); rerr != nil {
 		return fmt.Errorf("register task: %v: %s; run-key: %v",
-			err, strings.TrimSpace(out), rerr)
+			taskErr, strings.TrimSpace(taskOut), rerr)
 	}
 	startDaemonNow(exePath)
 	return nil

@@ -10,6 +10,14 @@ import (
 	"time"
 )
 
+const (
+	// identityKeyComment is the comment stamped on generated keys. It is also
+	// re-appended to derived public lines, which ssh-keygen prints without one.
+	identityKeyComment = "tailssh"
+
+	identityKeygenTimeout = 30 * time.Second
+)
+
 // ensureIdentity guarantees an ed25519 keypair exists at appKeyPath() and
 // returns the private-key path plus the trimmed public-key line (the single
 // "ssh-ed25519 AAAA... tailssh" line served by the keyserver).
@@ -29,52 +37,13 @@ func ensureIdentity(pl Platform) (privPath, pubLine string, err error) {
 		if !os.IsNotExist(statErr) {
 			return "", "", fmt.Errorf("stat key: %w", statErr)
 		}
-		// A stale/partial .pub from a prior aborted run must be removed: keygen
-		// refuses to overwrite an existing output file.
-		_ = os.Remove(pubPath)
-
-		bin, lookErr := exec.LookPath("ssh-keygen")
-		if lookErr != nil {
-			return "", "", fmt.Errorf("ssh-keygen not found: %w", lookErr)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		// -N "" (no passphrase), -C tailssh (comment), -f <path> (output).
-		cmd := exec.CommandContext(ctx, bin,
-			"-t", "ed25519", "-N", "", "-C", "tailssh", "-f", privPath)
-		if out, runErr := cmd.CombinedOutput(); runErr != nil {
-			return "", "", fmt.Errorf("ssh-keygen failed: %w: %s",
-				runErr, strings.TrimSpace(string(out)))
+		if err = identityGenerateKeypair(privPath, pubPath); err != nil {
+			return "", "", err
 		}
 	}
 
-	pubBytes, readErr := os.ReadFile(pubPath)
-	if readErr != nil {
-		if !os.IsNotExist(readErr) {
-			return "", "", fmt.Errorf("read public key: %w", readErr)
-		}
-		// The private key exists but its .pub is missing (e.g. deleted out of
-		// band). Derive the public line from the private key rather than failing.
-		bin, lookErr := exec.LookPath("ssh-keygen")
-		if lookErr != nil {
-			return "", "", fmt.Errorf("ssh-keygen not found: %w", lookErr)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		// -y prints the public key derived from the private key to stdout.
-		out, runErr := exec.CommandContext(ctx, bin, "-y", "-f", privPath).Output()
-		if runErr != nil {
-			return "", "", fmt.Errorf("derive public key: %w", runErr)
-		}
-		// -y omits the comment; re-append "tailssh" so the derived line matches a
-		// freshly generated key, then persist it (best effort) for later runs.
-		pubLine = strings.TrimSpace(string(out))
-		if pubLine != "" {
-			pubLine += " tailssh"
-		}
-		_ = os.WriteFile(pubPath, []byte(pubLine+"\n"), 0o644)
-	} else {
-		pubLine = strings.TrimSpace(string(pubBytes))
+	if pubLine, err = identityPublicLine(privPath, pubPath); err != nil {
+		return "", "", err
 	}
 	if pubLine == "" {
 		return "", "", fmt.Errorf("public key %s is empty", pubPath)
@@ -85,4 +54,78 @@ func ensureIdentity(pl Platform) (privPath, pubLine string, err error) {
 	}
 
 	return privPath, pubLine, nil
+}
+
+// identityGenerateKeypair writes a fresh passphrase-less ed25519 keypair at
+// privPath. A stale/partial .pub left by an aborted run is removed first
+// because ssh-keygen refuses to overwrite an existing output file.
+func identityGenerateKeypair(privPath, pubPath string) error {
+	_ = os.Remove(pubPath)
+
+	bin, err := identityKeygenPath()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), identityKeygenTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin,
+		"-t", "ed25519", "-N", "", "-C", identityKeyComment, "-f", privPath)
+	if out, runErr := cmd.CombinedOutput(); runErr != nil {
+		return fmt.Errorf("ssh-keygen failed: %w: %s",
+			runErr, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// identityPublicLine returns the trimmed public-key line, reading pubPath when
+// present. A missing .pub (deleted out of band) is re-derived from the private
+// key rather than treated as failure, then persisted best effort for later runs.
+func identityPublicLine(privPath, pubPath string) (string, error) {
+	pubBytes, readErr := os.ReadFile(pubPath)
+	if readErr == nil {
+		return strings.TrimSpace(string(pubBytes)), nil
+	}
+	if !os.IsNotExist(readErr) {
+		return "", fmt.Errorf("read public key: %w", readErr)
+	}
+
+	pubLine, err := identityDerivePublicLine(privPath)
+	if err != nil {
+		return "", err
+	}
+	_ = os.WriteFile(pubPath, []byte(pubLine+"\n"), 0o644)
+	return pubLine, nil
+}
+
+// identityDerivePublicLine recomputes the public-key line from the private key.
+// ssh-keygen -y prints it without the comment, so identityKeyComment is
+// re-appended to keep the line identical to a freshly generated one.
+func identityDerivePublicLine(privPath string) (string, error) {
+	bin, err := identityKeygenPath()
+	if err != nil {
+		return "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), identityKeygenTimeout)
+	defer cancel()
+	out, runErr := exec.CommandContext(ctx, bin, "-y", "-f", privPath).Output()
+	if runErr != nil {
+		return "", fmt.Errorf("derive public key: %w", runErr)
+	}
+
+	pubLine := strings.TrimSpace(string(out))
+	if pubLine == "" {
+		return "", nil
+	}
+	return pubLine + " " + identityKeyComment, nil
+}
+
+// identityKeygenPath locates the ssh-keygen binary both key operations shell out to.
+func identityKeygenPath() (string, error) {
+	bin, err := exec.LookPath("ssh-keygen")
+	if err != nil {
+		return "", fmt.Errorf("ssh-keygen not found: %w", err)
+	}
+	return bin, nil
 }

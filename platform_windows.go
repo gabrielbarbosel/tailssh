@@ -3,23 +3,38 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
+	"unicode/utf16"
 )
 
 const windowsSvcName = "tailssh"
 
 // windowsPlatform implements Platform for Windows using PowerShell (service +
 // capability + firewall control) and icacls (ACL hardening).
+//
+// Two distinct facts are tracked because they answer different questions:
+//   - adminGroup: is the login account a member of Administrators? This is what
+//     sshd keys off — for a member it authorizes ONLY against the ProgramData
+//     administrators_authorized_keys, never the per-user file. It decides the
+//     target key file and its ACL principal.
+//   - elevated: does this process hold an elevated token? This is a capability —
+//     writing under ProgramData and creating a /RL HIGHEST task both need it.
+//
+// Conflating the two is a silent-failure trap: an unelevated admin writing peer
+// keys to the per-user file (which sshd ignores) leaves inbound auth broken.
 type windowsPlatform struct {
-	admin bool
+	adminGroup bool
+	elevated   bool
 }
 
 func newPlatform() Platform {
-	return &windowsPlatform{admin: windowsIsAdmin()}
+	return &windowsPlatform{adminGroup: windowsInAdminGroup(), elevated: windowsIsElevated()}
 }
 
 func (p windowsPlatform) OpenURL(url string) error {
@@ -45,14 +60,36 @@ func windowsPowershell(script string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// windowsIsAdmin reports Administrators membership. A false result on error
-// keeps behavior in the safe, unprivileged path.
-func windowsIsAdmin() bool {
+// windowsIsElevated reports whether this process runs with an elevated token —
+// the capability needed to write under ProgramData and to register a /RL HIGHEST
+// scheduled task. A false result on error keeps behavior in the unprivileged path.
+func windowsIsElevated() bool {
 	out, err := windowsPowershell(
 		"([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent())" +
 			".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)")
 	if err != nil {
 		return false
+	}
+	return strings.EqualFold(out, "True")
+}
+
+// windowsInAdminGroup reports whether the login account is a member of the local
+// Administrators group, independent of the current process's elevation — the exact
+// condition Windows OpenSSH uses to switch inbound auth to
+// administrators_authorized_keys. Elevation is not a substitute: an unelevated
+// admin's token carries the Administrators SID as deny-only, so IsInRole/token
+// checks report false. Membership is resolved by the well-known SID S-1-5-32-544
+// (locale-independent); on any query failure it falls back to the elevation check,
+// which can only under-report, never authorize the wrong file.
+func windowsInAdminGroup() bool {
+	out, err := windowsPowershell(
+		"$me=([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value;" +
+			"try{((Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop|" +
+			"Where-Object{$_.SID.Value -eq $me}|Measure-Object).Count -gt 0)}" +
+			"catch{([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent())" +
+			".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)}")
+	if err != nil {
+		return windowsIsElevated()
 	}
 	return strings.EqualFold(out, "True")
 }
@@ -102,10 +139,47 @@ func windowsAdminKeysPath() string {
 	return filepath.Join(pd, "ssh", "administrators_authorized_keys")
 }
 
-// AuthorizedKeysPath returns the admin-wide file when elevated, else the
-// per-user file. sshd on Windows requires admins to use the ProgramData file.
+// windowsAdminKeysActive reports whether sshd_config actually routes
+// Administrators members to administrators_authorized_keys — the stock
+// "Match Group administrators" block with its AuthorizedKeysFile override.
+// Real machines drift: with that block commented out, sshd reads the
+// per-user file for every account, and keys written to the admin file are
+// silently ignored. sshd_config is the source of truth, so the managed
+// block must follow it. Unreadable config falls back to the stock default.
+func windowsAdminKeysActive() bool {
+	pd := os.Getenv("ProgramData")
+	if pd == "" {
+		pd = `C:\ProgramData`
+	}
+	data, err := os.ReadFile(filepath.Join(pd, "ssh", "sshd_config"))
+	if err != nil {
+		return true
+	}
+	inAdminMatch := false
+	for _, line := range strings.Split(string(data), "\n") {
+		l := strings.ToLower(strings.TrimSpace(line))
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		if strings.HasPrefix(l, "match ") {
+			inAdminMatch = strings.Contains(l, "group administrators")
+			continue
+		}
+		if inAdminMatch && strings.HasPrefix(l, "authorizedkeysfile") &&
+			strings.Contains(l, "administrators_authorized_keys") {
+			return true
+		}
+	}
+	return false
+}
+
+// AuthorizedKeysPath returns the file sshd actually reads for this account:
+// the admin-wide file for an Administrators member under a stock sshd_config,
+// else the per-user file. Membership is decided by group, never elevation, so
+// an unelevated admin daemon still targets the file sshd honors (writing it
+// then requires elevation).
 func (p windowsPlatform) AuthorizedKeysPath() (string, error) {
-	if p.admin {
+	if p.adminGroup && windowsAdminKeysActive() {
 		return windowsAdminKeysPath(), nil
 	}
 	home, err := os.UserHomeDir()
@@ -117,32 +191,127 @@ func (p windowsPlatform) AuthorizedKeysPath() (string, error) {
 
 // SecureKeyFile applies the ACL sshd's StrictModes requires: inheritance
 // disabled, and only SYSTEM plus the appropriate principal granted full
-// control. Wrong or extra-writable ACLs make sshd silently ignore the file.
+// control. The principal follows the file, not the account: only the
+// admin-wide keys file belongs to Administrators; per-user files (and the
+// private identity) get the tightest ACL — the owning user alone.
+// Wrong or extra-writable ACLs make sshd silently ignore the file.
+//
+// Grants are applied BEFORE inheritance is stripped. The reverse order leaves the
+// file with no ACE at all whenever the grant step fails, locking out every
+// principal — including Administrators, for whom the only way back is taking
+// ownership from an elevated shell.
 func (p windowsPlatform) SecureKeyFile(path string) error {
-	if out, err := exec.Command("icacls", path, "/inheritance:r").CombinedOutput(); err != nil {
-		return fmt.Errorf("icacls inheritance: %v: %s", err, strings.TrimSpace(string(out)))
-	}
 	grants := []string{"/grant", "SYSTEM:F"}
-	if p.admin {
+	if path == windowsAdminKeysPath() {
 		// Administrators well-known SID S-1-5-32-544.
 		grants = append(grants, "/grant", "*S-1-5-32-544:F")
 	} else {
-		// Qualify the account with its domain (USERDOMAIN\USERNAME) so icacls
-		// resolves the right principal; a bare USERNAME can be ambiguous or fail
-		// to resolve on domain-joined or multi-account machines.
-		if u := os.Getenv("USERNAME"); u != "" {
-			principal := u
-			if dom := os.Getenv("USERDOMAIN"); dom != "" {
-				principal = dom + `\` + u
-			}
-			grants = append(grants, "/grant", principal+":F")
+		// Grant by SID, never by name: name principals are locale-dependent and
+		// unmappable on workgroup machines, where USERDOMAIN is the workgroup —
+		// not a security authority (icacls error 1332). os/user resolves the
+		// current account's SID directly.
+		if u, uerr := user.Current(); uerr == nil && u.Uid != "" {
+			grants = append(grants, "/grant", "*"+u.Uid+":F")
+		} else if name := os.Getenv("USERNAME"); name != "" {
+			grants = append(grants, "/grant", name+":F")
 		}
 	}
 	args := append([]string{path}, grants...)
 	if out, err := exec.Command("icacls", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("icacls grant: %v: %s", err, strings.TrimSpace(string(out)))
 	}
+	if out, err := exec.Command("icacls", path, "/inheritance:r").CombinedOutput(); err != nil {
+		return fmt.Errorf("icacls inheritance: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return verifyReadable(path)
+}
+
+// verifyReadable confirms the ACL just applied still lets this process open the
+// file. icacls exits 0 on ACLs that are silently unusable, so an actual open is
+// the only trustworthy check — the caveat DESIGN.md records as "verify the
+// resulting ACL, don't assume icacls success".
+func verifyReadable(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("ACL verification failed — %s unreadable after securing: %w", path, err)
+	}
+	return f.Close()
+}
+
+// EnsurePrivilege re-launches tailssh elevated when the account is an
+// Administrators member but the current process is not elevated — the exact case
+// where provisioning would otherwise write peer keys into the per-user file sshd
+// ignores. It escalates the same command through a single UAC prompt (Start-Process
+// -Verb RunAs), waits for the elevated instance to finish, and returns handled=true
+// so the unprivileged caller stops. Already-elevated or non-admin accounts need no
+// escalation (handled=false): the daemon task runs elevated, and a standard account
+// correctly manages its own per-user file.
+func (p windowsPlatform) EnsurePrivilege(args []string) (bool, error) {
+	if !p.adminGroup || p.elevated {
+		return false, nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return false, err
+	}
+	if err := runElevatedAndWait(exe, args); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// runElevatedAndWait re-runs exe with args elevated and blocks until it finishes.
+//
+// The elevated command is carried as a -EncodedCommand (UTF-16LE base64), which
+// passes through Start-Process with no quoting hazard — the reason a plain
+// -ArgumentList handoff is unreliable (a dropped flag silently downgrades, e.g.
+// `up --yes` to a read-only `up` that provisions nothing). The elevated instance
+// redirects all output to a log and records its real exit code in a sentinel file,
+// because an unelevated parent cannot read an elevated child's exit code directly —
+// so this is the only way to tell success from a mid-run failure or declined UAC.
+func runElevatedAndWait(exe string, args []string) error {
+	tmp := os.TempDir()
+	logPath := filepath.Join(tmp, "tailssh-elevated.log")
+	exitPath := filepath.Join(tmp, "tailssh-elevated.exit")
+	_ = os.Remove(logPath)
+	_ = os.Remove(exitPath)
+
+	psSingle := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
+	inner := "& " + psSingle(exe)
+	for _, a := range args {
+		inner += " " + psSingle(a)
+	}
+	inner += " *> " + psSingle(logPath) +
+		"; Set-Content -LiteralPath " + psSingle(exitPath) + " -Value $LASTEXITCODE"
+
+	outer := fmt.Sprintf(
+		"Start-Process powershell -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','%s' -Verb RunAs -Wait",
+		base64.StdEncoding.EncodeToString(utf16LEBytes(inner)))
+	if out, err := windowsPowershell(outer); err != nil {
+		return fmt.Errorf("elevation failed or was declined: %v: %s", err, out)
+	}
+
+	code, err := os.ReadFile(exitPath)
+	if err != nil {
+		return fmt.Errorf("elevated run left no exit status (UAC declined or launch failed)")
+	}
+	if c := strings.TrimSpace(string(code)); c != "" && c != "0" {
+		out, _ := os.ReadFile(logPath)
+		return fmt.Errorf("elevated tailssh exited %s: %s", c, strings.TrimSpace(string(out)))
+	}
 	return nil
+}
+
+// utf16LEBytes encodes s as UTF-16LE, the wire format PowerShell -EncodedCommand
+// expects after base64-decoding.
+func utf16LEBytes(s string) []byte {
+	u := utf16.Encode([]rune(s))
+	b := make([]byte, len(u)*2)
+	for i, r := range u {
+		b[2*i] = byte(r)
+		b[2*i+1] = byte(r >> 8)
+	}
+	return b
 }
 
 func (windowsPlatform) SupportsIPNBus() bool { return true }
@@ -181,30 +350,58 @@ func sshHostKeyPubPath() string {
 // InstallDaemon registers the tailssh daemon as a Scheduled Task that runs the
 // exe's "daemon" subcommand at logon. tailssh is a plain console program, not a
 // Win32 service — an sc.exe service would fail to answer the SCM and die with
-// Error 1053. A scheduled task avoids the SCM protocol entirely and runs as the
-// interactive user with highest privileges.
+// Error 1053. A scheduled task avoids the SCM protocol entirely.
+//
+// The principal uses S4U, not Interactive: an Interactive principal runs the
+// daemon inside the desktop session, which attaches a visible console window and
+// tears the daemon down at logoff — leaving the keyserver unreachable until the
+// next logon. S4U runs it detached, with no console and no stored password, while
+// still loading the user profile the daemon needs to write ~/.ssh.
+//
+// The task is registered via Register-ScheduledTask, not schtasks.exe: schtasks
+// defaults are lethal to a laptop daemon (start blocked on battery power — the
+// task and any /Run just sit "Queued" — and a 72h ExecutionTimeLimit that kills
+// a long-running daemon) and it has no flags to change either. The settings set
+// below allows battery start/continue, removes the time limit, and auto-restarts
+// the daemon if it crashes.
 func (p windowsPlatform) InstallDaemon(exePath string) error {
-	tr := fmt.Sprintf(`"%s" daemon`, exePath)
-	// /F overwrites any existing task, making install idempotent. /RL HIGHEST needs
-	// elevation, so this path is taken only when running as admin.
-	out, err := exec.Command("schtasks", "/Create",
-		"/TN", windowsSvcName,
-		"/TR", tr,
-		"/SC", "ONLOGON",
-		"/RL", "HIGHEST",
-		"/F").CombinedOutput()
-	if err != nil {
-		// Not elevated: fall back to a per-user autostart (HKCU Run key), which needs
-		// no admin and starts the daemon at each logon. Start it now too, detached.
-		if rerr := installRunKey(exePath); rerr != nil {
-			return fmt.Errorf("schtasks: %v: %s; run-key: %v",
-				err, strings.TrimSpace(string(out)), rerr)
-		}
-		startDaemonNow(exePath)
+	psq := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
+	// -Force overwrites any existing task, making install idempotent. RunLevel
+	// Highest needs elevation, so this path succeeds only when running as admin.
+	script := "$ErrorActionPreference='Stop';" +
+		"$a=New-ScheduledTaskAction -Execute '" + psq(exePath) + "' -Argument 'daemon';" +
+		"$t=New-ScheduledTaskTrigger -AtLogOn;" +
+		"$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries" +
+		" -ExecutionTimeLimit ([TimeSpan]::Zero)" +
+		" -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1);" +
+		"$p=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name)" +
+		" -LogonType S4U -RunLevel Highest;" +
+		"Register-ScheduledTask -TaskName '" + windowsSvcName + "' -Action $a -Trigger $t" +
+		" -Settings $s -Principal $p -Force | Out-Null;" +
+		"Start-ScheduledTask -TaskName '" + windowsSvcName + "'"
+	out, err := windowsPowershell(script)
+	if err == nil {
 		return nil
 	}
-	// Start now so the daemon runs without waiting for the next logon.
-	_, _ = exec.Command("schtasks", "/Run", "/TN", windowsSvcName).CombinedOutput()
+	// The elevated task couldn't be created (this process isn't elevated). On an
+	// Administrators account the daemon MUST run elevated — only then can it write
+	// and ACL administrators_authorized_keys, the sole file sshd reads for admins.
+	// The unprivileged run-key fallback would run the daemon unelevated and it would
+	// authorize peers into the per-user file sshd ignores, silently breaking inbound
+	// key auth. Fail fast with a clear pointer instead of installing that trap.
+	if p.adminGroup {
+		return fmt.Errorf("daemon must run elevated on an Administrators account so it can "+
+			"manage %s (the only keys file sshd reads for admins) — re-run install from an "+
+			"elevated shell: register task: %v: %s",
+			windowsAdminKeysPath(), err, strings.TrimSpace(out))
+	}
+	// Standard (non-admin) account: the unprivileged run-key daemon is correct — it
+	// manages the per-user authorized_keys, which is exactly what sshd reads there.
+	if rerr := installRunKey(exePath); rerr != nil {
+		return fmt.Errorf("register task: %v: %s; run-key: %v",
+			err, strings.TrimSpace(out), rerr)
+	}
+	startDaemonNow(exePath)
 	return nil
 }
 

@@ -35,13 +35,19 @@ func runUninstall(pl Platform) error {
 
 	// Revoke inbound access: clear the managed authorized_keys block.
 	if path, err := pl.AuthorizedKeysPath(); err == nil {
-		clearManagedBlock(path, pl)
-		fmt.Printf("  authorized_keys: managed block cleared\n")
+		if err := clearManagedBlock(path, pl); err != nil {
+			fmt.Printf("  authorized_keys: NOT cleared — %v\n", err)
+		} else {
+			fmt.Printf("  authorized_keys: managed block cleared\n")
+		}
 	}
 
 	if home, err := os.UserHomeDir(); err == nil {
-		clearManagedBlock(filepath.Join(home, ".ssh", "config"), nil)
-		fmt.Printf("  ssh_config     : managed block cleared\n")
+		if err := clearManagedBlock(filepath.Join(home, ".ssh", "config"), nil); err != nil {
+			fmt.Printf("  ssh_config     : NOT cleared — %v\n", err)
+		} else {
+			fmt.Printf("  ssh_config     : managed block cleared\n")
+		}
 	}
 
 	// dir holds the app identity + peer cache.
@@ -66,17 +72,26 @@ func runUninstall(pl Platform) error {
 }
 
 // clearManagedBlock removes the tailssh-managed region from a file, keeping the
-// user's own content, and re-secures it via pl when pl != nil.
-func clearManagedBlock(path string, pl Platform) {
+// user's own content, and re-secures it via pl when pl != nil. An absent file is
+// not an error — uninstall also runs where the block was never written — but any
+// other read failure is, since it means the user's content cannot be preserved.
+func clearManagedBlock(path string, pl Platform) error {
 	existing, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
 	if err != nil {
-		return
+		return err
 	}
 	stripped := strings.TrimRight(stripManagedBlock(string(existing)), "\n") + "\n"
 	if sameContent(path, []byte(stripped)) {
-		return
+		return nil
 	}
-	if atomicWrite(path, []byte(stripped), 0o600) == nil && pl != nil {
-		pl.SecureKeyFile(path)
+	if err := atomicWrite(path, []byte(stripped), 0o600); err != nil {
+		return err
 	}
+	if pl != nil {
+		return pl.SecureKeyFile(path)
+	}
+	return nil
 }

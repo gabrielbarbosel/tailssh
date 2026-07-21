@@ -244,7 +244,16 @@ func main() {
 			fail(err)
 		}
 	case "sync":
-		if err := runSync(selectPlatform()); err != nil {
+		pl := selectPlatform()
+		// A manual sync writes the same system-wide files provisioning does, so it
+		// self-elevates on a Windows admin account (the daemon's own syncs already
+		// run elevated via its task). No-op elsewhere.
+		if handled, err := pl.EnsurePrivilege(os.Args[1:]); err != nil {
+			fail(err)
+		} else if handled {
+			return
+		}
+		if err := runSync(pl); err != nil {
 			fail(err)
 		}
 	case "daemon":

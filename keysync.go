@@ -591,7 +591,13 @@ func writeSSHConfig(owned []device, keyed map[string]cachedPeer) error {
 		}
 	}
 
-	existing, _ := os.ReadFile(path)
+	// A read failure that is not "absent" (a permission/ACL problem, say) must abort:
+	// treating it as an empty file would regenerate the config from the managed block
+	// alone and silently discard every Host entry the user wrote by hand.
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w (refusing to rewrite it — user Host entries would be lost)", path, err)
+	}
 	out := withManagedBlock(existing, strings.TrimRight(b.String(), "\n"))
 	if sameContent(path, out) {
 		return nil

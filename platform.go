@@ -55,4 +55,12 @@ type Platform interface {
 	InstallDaemon(exePath string) error
 	// RemoveDaemon uninstalls the daemon service.
 	RemoveDaemon() error
+
+	// EnsurePrivilege guarantees the process can perform the privileged provisioning
+	// steps (write the system-wide authorized_keys, register a boot service). When it
+	// re-launches the current command elevated to obtain them, it reports handled=true
+	// so the caller stops and lets the elevated instance finish the work. On platforms
+	// that escalate per-command (sudo) or already run privileged, it is a no-op
+	// returning handled=false. args is the argument vector to re-run (os.Args[1:]).
+	EnsurePrivilege(args []string) (handled bool, err error)
 }

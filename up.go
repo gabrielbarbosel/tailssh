@@ -241,6 +241,17 @@ func runUp(pl Platform, yes bool) error {
 	// prior one may not have existed and builds it up; load-bearing stages that
 	// can't be satisfied stop with a clear pointer instead of failing downstream.
 
+	// STAGE 0 — privilege. On a Windows Administrators account this re-launches
+	// tailssh elevated (one UAC prompt) and hands the rest to the elevated instance;
+	// without it, provisioning would write peer keys to the per-user file sshd
+	// ignores for admins. A no-op where per-command sudo suffices (Linux/macOS).
+	if handled, err := pl.EnsurePrivilege(os.Args[1:]); err != nil {
+		return fmt.Errorf("elevation: %w", err)
+	} else if handled {
+		fmt.Println("\nprovisioned in an elevated instance — done.")
+		return nil
+	}
+
 	// STAGE 1 — network. Ensure Tailscale is up (CLI logged in, or the Android app
 	// connected on Termux). We do NOT require peer discovery to succeed: a fresh
 	// CLI-less node has no roster yet and will be handed one by a CLI peer after its

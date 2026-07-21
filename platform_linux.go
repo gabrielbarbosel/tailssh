@@ -479,6 +479,10 @@ func (p *linuxPlatform) SecureKeyFile(path string) error {
 // works) and false under Termux, where there is no local Tailscale CLI/bus.
 func (p *linuxPlatform) SupportsIPNBus() bool { return !p.termux }
 
+// EnsurePrivilege is a no-op on Linux: privileged provisioning steps escalate per
+// command via sudo where needed, so the process itself is never re-launched.
+func (p *linuxPlatform) EnsurePrivilege([]string) (bool, error) { return false, nil }
+
 // InstallDaemon installs the tailssh daemon as a persistent service: a systemd
 // unit on Linux, or a Termux:Boot script under Termux.
 func (p *linuxPlatform) InstallDaemon(exePath string) error {

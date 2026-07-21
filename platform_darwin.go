@@ -149,6 +149,10 @@ func sshHostKeyPubPath() string {
 	return "/etc/ssh/ssh_host_ed25519_key.pub"
 }
 
+// EnsurePrivilege is a no-op on macOS: the daemon runs as a per-user LaunchAgent
+// and privileged steps escalate per command via sudo, so no re-launch is needed.
+func (p darwinPlatform) EnsurePrivilege([]string) (bool, error) { return false, nil }
+
 // InstallDaemon writes a per-user LaunchAgent plist and loads it. Running as the
 // logged-in user keeps authorized_keys owned correctly and avoids root/TCC. The
 // PATH is widened so the Tailscale.app CLI is discoverable from the agent.

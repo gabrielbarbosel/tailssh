@@ -593,7 +593,33 @@ func (p *linuxPlatform) installTermuxDaemon(exePath string) error {
 		return err
 	}
 	p.ensureTermuxBoot()
+	assistTermuxBattery()
 	return nil
+}
+
+// termuxBatteryTargets are the apps whose battery optimisation must be relaxed so
+// Android's Doze can't freeze them: Termux (hosts the tailssh daemon and sshd) and
+// the Tailscale app (the transport — if it is frozen the phone is unreachable even
+// though it shows online). Tailscale is opened last so it lands in the foreground.
+var termuxBatteryTargets = []struct{ pkg, label string }{
+	{"com.termux", "Termux"},
+	{"com.tailscale.ipn", "Tailscale"},
+}
+
+// assistTermuxBattery opens each app's details screen so the user is one tap from
+// setting it battery-"Unrestricted", which keeps the daemon and the tailnet alive
+// through Doze. Android forbids exempting an app without user consent, so this can
+// only open the right screen — it can't flip the toggle — and it is best-effort:
+// printing the path matters more than the screen opening, and the daemon's wake lock
+// already softens Doze while held.
+func assistTermuxBattery() {
+	fmt.Println("  battery     : set BOTH to \"Unrestricted\" so Doze can't freeze the mesh")
+	fmt.Println("                (App info -> Battery -> Unrestricted; opening the screens):")
+	for _, t := range termuxBatteryTargets {
+		fmt.Printf("                - %s\n", t.label)
+		_ = exec.Command("am", "start", "-a", "android.settings.APPLICATION_DETAILS_SETTINGS",
+			"-d", "package:"+t.pkg).Run()
+	}
 }
 
 // termuxDaemonSupervisorScript builds the Termux:Boot script that supervises the

@@ -74,7 +74,10 @@ ssh my-server
 
 - **Termux/Android**: sshd runs on `8022`. Install assists with the **Termux:Boot** app
   (opens its F-Droid page and waits) so the daemon auto-starts after a reboot; the daemon
-  holds a wake lock so Android's Doze can't freeze it (see `TAILSSH_BATTERY`).
+  holds a wake lock so Android's Doze can't freeze it (see `TAILSSH_BATTERY`). `up` also
+  opens the battery screens for Termux and Tailscale — set both to **Unrestricted** so
+  Doze can't freeze the daemon or the transport (Android requires this tap; it can't be
+  granted programmatically).
 - **Windows/Termux** join via OpenSSH + key (Tailscale SSH itself only serves Linux/macOS);
   MagicDNS resolves the name identically, so `ssh <name>` works the same everywhere. On
   Windows the daemon persists via a scheduled task (elevated) or a per-user Run key.

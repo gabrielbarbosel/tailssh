@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -58,11 +57,11 @@ func termuxPrefix() string {
 func (p *linuxPlatform) OpenURL(url string) error {
 	if p.termux {
 		if have("termux-open-url") {
-			return exec.Command("termux-open-url", url).Run()
+			return command("termux-open-url", url).Run()
 		}
-		return exec.Command("am", "start", "-a", "android.intent.action.VIEW", "-d", url).Run()
+		return command("am", "start", "-a", "android.intent.action.VIEW", "-d", url).Run()
 	}
-	return exec.Command("xdg-open", url).Start()
+	return command("xdg-open", url).Start()
 }
 
 // InstallTailscale auto-installs on Linux via the official script. On Termux the
@@ -91,11 +90,11 @@ var termuxTailscaleActivities = []string{
 // launcher without a hardcoded activity name. It reports whether the app launched.
 func launchTermuxTailscaleApp() bool {
 	for _, comp := range termuxTailscaleActivities {
-		if exec.Command("am", "start", "-n", comp).Run() == nil {
+		if command("am", "start", "-n", comp).Run() == nil {
 			return true
 		}
 	}
-	return exec.Command("monkey", "-p", "com.tailscale.ipn",
+	return command("monkey", "-p", "com.tailscale.ipn",
 		"-c", "android.intent.category.LAUNCHER", "1").Run() == nil
 }
 
@@ -122,7 +121,7 @@ func (p *linuxPlatform) run(name string, args ...string) error {
 		args = append([]string{name}, args...)
 		name = "sudo"
 	}
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	out, err := commandContext(ctx, name, args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: %v: %s", name, err, strings.TrimSpace(string(out)))
 	}
@@ -131,8 +130,7 @@ func (p *linuxPlatform) run(name string, args ...string) error {
 
 // have reports whether a binary is resolvable on PATH.
 func have(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
+	return haveExecutable(name)
 }
 
 // diskEncryption reports this device's at-rest encryption posture (best-effort).
@@ -143,7 +141,7 @@ func diskEncryption() (on bool, detail string) {
 		return true, "Android file-based encryption (mandatory)"
 	}
 	if have("lsblk") {
-		out, err := exec.Command("lsblk", "-no", "TYPE").Output()
+		out, err := command("lsblk", "-no", "TYPE").Output()
 		if err == nil {
 			if strings.Contains(string(out), "crypt") {
 				return true, "LUKS/dm-crypt"
@@ -178,7 +176,7 @@ func hasOpenRC() bool {
 // sshdInstalled probes for an sshd binary in PATH and the usual sbin locations.
 func sshdInstalled() bool {
 	for _, c := range []string{"sshd", "/usr/sbin/sshd", "/usr/bin/sshd"} {
-		if _, err := exec.LookPath(c); err == nil {
+		if haveExecutable(c) {
 			return true
 		}
 		if _, err := os.Stat(c); err == nil {
@@ -193,7 +191,7 @@ func sshdInstalled() bool {
 // port (via ss, then /proc/net/tcp) rather than reporting not-running.
 func sshdRunning(port int) bool {
 	if have("pgrep") {
-		return exec.Command("pgrep", "-x", "sshd").Run() == nil
+		return command("pgrep", "-x", "sshd").Run() == nil
 	}
 	return listeningOn(port)
 }
@@ -202,7 +200,7 @@ func sshdRunning(port int) bool {
 // port, using ss when available and otherwise parsing /proc/net/tcp{,6}.
 func listeningOn(port int) bool {
 	if have("ss") {
-		if out, err := exec.Command("ss", "-Hltn").Output(); err == nil {
+		if out, err := command("ss", "-Hltn").Output(); err == nil {
 			want := fmt.Sprintf(":%d", port)
 			for _, line := range strings.Split(string(out), "\n") {
 				fields := strings.Fields(line)
@@ -254,7 +252,7 @@ func (p *linuxPlatform) SSHState() (installed, running bool) {
 	case hasSystemd():
 		running = systemdSSHActive()
 	case hasOpenRC():
-		running = exec.Command("rc-service", "sshd", "status").Run() == nil
+		running = command("rc-service", "sshd", "status").Run() == nil
 	default:
 		running = sshdRunning(p.SSHListenPort())
 	}
@@ -269,7 +267,7 @@ var sshSystemdUnits = []string{"ssh", "sshd", "ssh.socket"}
 // the classic ssh/sshd service and socket-activated ssh.socket.
 func systemdSSHActive() bool {
 	for _, u := range sshSystemdUnits {
-		out, _ := exec.Command("systemctl", "is-active", u).Output()
+		out, _ := command("systemctl", "is-active", u).Output()
 		if strings.TrimSpace(string(out)) == "active" {
 			return true
 		}
@@ -325,7 +323,7 @@ func (p *linuxPlatform) installOpenSSHServerPackage() error {
 // a no-op when neither is active. Not used under Termux (unprivileged).
 func (p *linuxPlatform) openFirewall() {
 	if have("ufw") {
-		if out, err := exec.Command("ufw", "status").Output(); err == nil &&
+		if out, err := command("ufw", "status").Output(); err == nil &&
 			strings.Contains(string(out), "Status: active") {
 			_ = p.run("ufw", "allow", "in", "on", "tailscale0")
 			_ = p.run("ufw", "allow", "OpenSSH")
@@ -333,7 +331,7 @@ func (p *linuxPlatform) openFirewall() {
 		}
 	}
 	if have("firewall-cmd") {
-		if out, err := exec.Command("firewall-cmd", "--state").Output(); err == nil &&
+		if out, err := command("firewall-cmd", "--state").Output(); err == nil &&
 			strings.TrimSpace(string(out)) == "running" {
 			_ = p.run("firewall-cmd", "--permanent", "--add-service=ssh")
 			_ = p.run("firewall-cmd", "--reload")
@@ -369,7 +367,7 @@ func persistenceNote() string {
 // boot script at device startup). The second return is false when the package
 // manager can't be queried, so callers don't nag on an inconclusive check.
 func termuxBootInstalled() (installed, known bool) {
-	out, err := exec.Command("pm", "list", "packages", "com.termux.boot").Output()
+	out, err := command("pm", "list", "packages", "com.termux.boot").Output()
 	if err != nil {
 		return false, false
 	}
@@ -457,7 +455,7 @@ func (p *linuxPlatform) enableTermuxSSHOnBoot() error {
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		return err
 	}
-	_ = exec.Command("sshd").Run()
+	_ = command("sshd").Run()
 	return nil
 }
 
@@ -512,7 +510,7 @@ func (p *linuxPlatform) SecureKeyFile(path string) error {
 
 // selinuxEnforcing reports whether SELinux is in enforcing mode (getenforce).
 func selinuxEnforcing() bool {
-	out, err := exec.Command("getenforce").Output()
+	out, err := command("getenforce").Output()
 	return err == nil && strings.TrimSpace(string(out)) == "Enforcing"
 }
 
@@ -522,8 +520,8 @@ func restoreSSHKeyLabels(dir, path string) {
 	if !selinuxEnforcing() {
 		return
 	}
-	_ = exec.Command("restorecon", dir).Run()
-	_ = exec.Command("restorecon", path).Run()
+	_ = command("restorecon", dir).Run()
+	_ = command("restorecon", path).Run()
 }
 
 // EnsureTailnetMTU lowers the tailscale0 link MTU to tailnetSafeMTU when it is
@@ -617,7 +615,7 @@ func assistTermuxBattery() {
 	fmt.Println("                (App info -> Battery -> Unrestricted; opening the screens):")
 	for _, t := range termuxBatteryTargets {
 		fmt.Printf("                - %s\n", t.label)
-		_ = exec.Command("am", "start", "-a", "android.settings.APPLICATION_DETAILS_SETTINGS",
+		_ = command("am", "start", "-a", "android.settings.APPLICATION_DETAILS_SETTINGS",
 			"-d", "package:"+t.pkg).Run()
 	}
 }
@@ -735,11 +733,11 @@ func (p *linuxPlatform) removeTermuxDaemon() error {
 		return err
 	}
 	script := filepath.Join(dir, "start-tailssh")
-	_ = exec.Command("pkill", "-f", script).Run()
+	_ = command("pkill", "-f", script).Run()
 	if exe, err := os.Executable(); err == nil {
-		_ = exec.Command("pkill", "-f", exe+" daemon").Run()
+		_ = command("pkill", "-f", exe+" daemon").Run()
 	}
-	_ = exec.Command("termux-wake-unlock").Run()
+	_ = command("termux-wake-unlock").Run()
 	if err := os.Remove(script); err != nil && !os.IsNotExist(err) {
 		return err
 	}

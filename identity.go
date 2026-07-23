@@ -122,10 +122,12 @@ func identityDerivePublicLine(privPath string) (string, error) {
 }
 
 // identityKeygenPath locates the ssh-keygen binary both key operations shell out to.
+// It resolves via lookExecutable (os.Stat-based on Linux) rather than exec.LookPath,
+// whose faccessat2 probe some Android/Termux seccomp policies kill with SIGSYS. A
+// resolved path is absolute (carries a separator); its absence means not found.
 func identityKeygenPath() (string, error) {
-	bin, err := exec.LookPath("ssh-keygen")
-	if err != nil {
-		return "", fmt.Errorf("ssh-keygen not found: %w", err)
+	if bin := lookExecutable("ssh-keygen"); strings.ContainsRune(bin, os.PathSeparator) {
+		return bin, nil
 	}
-	return bin, nil
+	return "", fmt.Errorf("ssh-keygen not found")
 }

@@ -57,7 +57,7 @@ func localUsername() string {
 		}
 	}
 	if name == "" {
-		if out, err := exec.Command("id", "-un").Output(); err == nil {
+		if out, err := command("id", "-un").Output(); err == nil {
 			name = strings.TrimSpace(string(out))
 		}
 	}

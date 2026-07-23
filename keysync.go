@@ -23,7 +23,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -363,7 +362,7 @@ func readHostKey(port int) string {
 func scanLocalHostKey(port int) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "ssh-keyscan", "-t", "ed25519",
+	out, err := commandContext(ctx, "ssh-keyscan", "-t", "ed25519",
 		"-p", strconv.Itoa(port), "127.0.0.1").Output()
 	if err != nil {
 		return ""

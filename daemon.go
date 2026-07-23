@@ -25,8 +25,6 @@ const (
 	// daemonRosterPushIdleInterval is the relaxed cadence used when no CLI-less peer
 	// answered, so a tailnet of only desktops does almost no idle work.
 	daemonRosterPushIdleInterval = 5 * time.Minute
-	// daemonFleetSweepInterval paces Taildrop onboarding of devices not yet in the mesh.
-	daemonFleetSweepInterval = 5 * time.Minute
 	// daemonReconcileInterval is Doze-aligned: real-time changes already arrive via
 	// /resync and roster pushes, so this only backstops drift and revocations — rare
 	// enough that a long interval keeps mobile wakeups (and battery) minimal.
@@ -34,6 +32,10 @@ const (
 	// daemonHealthyStreamDuration is how long a watch-ipn stream must survive before
 	// the transport counts as healthy and the reconnect backoff resets.
 	daemonHealthyStreamDuration = 30 * time.Second
+	// daemonMTUInterval is how often the daemon re-asserts the tailnet interface MTU,
+	// so a Tailscale self-update that resets the adapter's MTU is corrected within one
+	// interval. Kept long because the revert is rare and the check is cheap.
+	daemonMTUInterval = 15 * time.Minute
 )
 
 // localUsername is this device's login name, with any Windows DOMAIN\ prefix
@@ -101,7 +103,7 @@ func runDaemon(pl Platform) error {
 
 	engine.trigger(false)
 	daemonAnnouncePresence()
-	daemonStartSeedLoops(ctx)
+	daemonStartSeedLoops(ctx, pl)
 
 	if pl.SupportsIPNBus() {
 		watchIPN(ctx, engine)
@@ -173,13 +175,39 @@ func daemonAnnouncePresence() {
 }
 
 // daemonStartSeedLoops starts the background loops only a node with the tailscale CLI
-// can run, and is a no-op where the CLI is absent (Termux/Android).
-func daemonStartSeedLoops(ctx context.Context) {
+// can run, and is a no-op where the CLI is absent (Termux/Android). CLI presence also
+// gates the MTU loop: the CLI-less node is the phone, whose app-managed tun MTU
+// tailssh cannot set anyway, so skipping it there also spares the phone an idle wakeup.
+func daemonStartSeedLoops(ctx context.Context, pl Platform) {
 	if _, err := tailscaleBin(); err != nil {
 		return
 	}
 	go daemonPushRosterLoop(ctx)
-	go daemonSweepFleetLoop(ctx)
+	go daemonEnsureMTULoop(ctx, pl)
+}
+
+// daemonEnsureMTULoop keeps the Tailscale interface MTU clamped for broken-PMTU
+// direct paths (see EnsureTailnetMTU). It asserts once at startup and then on a slow
+// ticker, because a Tailscale self-update recreates the adapter and silently resets
+// its MTU with no netmap event to announce it — so this is the only thing that heals
+// the revert without waiting for the next logon.
+func daemonEnsureMTULoop(ctx context.Context, pl Platform) {
+	ensure := func() {
+		if err := pl.EnsureTailnetMTU(); err != nil {
+			log.Printf("daemon: mtu: %v", err)
+		}
+	}
+	ensure()
+	t := time.NewTicker(daemonMTUInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			ensure()
+		}
+	}
 }
 
 // daemonPushRosterLoop keeps CLI-less peers discoverable. Starting tailssh doesn't
@@ -202,24 +230,6 @@ func daemonPushRosterLoop(ctx context.Context) {
 			} else {
 				interval = daemonRosterPushIdleInterval
 			}
-		}
-	}
-}
-
-// daemonSweepFleetLoop onboards devices not yet in the mesh via Taildrop, sweeping once
-// at startup and then on a slow ticker.
-func daemonSweepFleetLoop(ctx context.Context) {
-	fleet := newOnboardState()
-	go fleetSweep(fleet)
-
-	t := time.NewTicker(daemonFleetSweepInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			fleetSweep(fleet)
 		}
 	}
 }

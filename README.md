@@ -38,8 +38,7 @@ ssh my-server
 | `tailssh status` | read-only health view: local server + posture (disk encryption, reboot persistence) and each peer's reachability — why `ssh <name>` does or doesn't work |
 | `tailssh up [--yes]` | audit; with `--yes`, an ordered bootstrap: ensure Tailscale → OpenSSH → identity → sync → daemon, auto-installing or opening the installer/login and waiting so it flows straight through |
 | `tailssh sync` | fetch trusted peers' keys → managed `authorized_keys` + `~/.ssh/config` + `known_hosts` |
-| `tailssh daemon` | event-driven: watch the tailnet and re-sync on every change (also auto-onboards new devices) |
-| `tailssh fleet` | self-propagation: Taildrop-push the installer to every same-owner device not yet in the mesh (the peer taps its Tailscale notification to run it) |
+| `tailssh daemon` | event-driven: watch the tailnet and re-sync on every change; also keeps the tailnet interface MTU clamped for broken-PMTU direct paths (e.g. to a phone) |
 | `tailssh acl [--apply]` | ensure the tailnet's `ssh accept` rule (preserving the rest of the policy); needs `TS_API_KEY` |
 | `tailssh off` | turn the service off (stop the daemon); keys stay, `up` re-arms it |
 | `tailssh uninstall` | remove tailssh from this machine (daemon, managed blocks, identity, binary) |

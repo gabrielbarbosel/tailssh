@@ -9,11 +9,16 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf16"
 )
 
 const windowsSvcName = "tailssh"
+
+// windowsTailscaleAdapter is the friendly name of the Tailscale network adapter,
+// the interface whose IPv4 subinterface MTU netsh reads and sets.
+const windowsTailscaleAdapter = "Tailscale"
 
 // windowsAdministratorsSID is the locale-independent well-known SID of the local
 // Administrators group.
@@ -332,6 +337,61 @@ func utf16LEBytes(s string) []byte {
 		b[2*i+1] = byte(r >> 8)
 	}
 	return b
+}
+
+// EnsureTailnetMTU lowers the Tailscale adapter's IPv4 subinterface MTU to
+// tailnetSafeMTU when it is higher, persistently (store=persistent) so it survives
+// a reboot. Setting a subinterface MTU needs elevation; the S4U daemon holds it,
+// so an unelevated instance defers instead of failing — the elevated daemon
+// re-asserts it (see EnsureTailnetMTU on Platform). Tailscale updates recreate the
+// adapter and reset the MTU to its 1280 default, so this is re-checked periodically.
+func (p windowsPlatform) EnsureTailnetMTU() error {
+	cur, ok := tailnetMTU()
+	if !ok || cur <= tailnetSafeMTU {
+		return nil
+	}
+	if !p.elevated {
+		return nil
+	}
+	out, err := exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
+		windowsTailscaleAdapter, "mtu="+strconv.Itoa(tailnetSafeMTU), "store=persistent").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("netsh set mtu: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// tailnetMTU reads the Tailscale adapter's current IPv4 MTU, the same value
+// EnsureTailnetMTU sets, so the two compare like for like. False when the adapter
+// is absent or netsh can't be read.
+func tailnetMTU() (int, bool) {
+	out, err := exec.Command("netsh", "interface", "ipv4", "show", "subinterfaces").Output()
+	if err != nil {
+		return 0, false
+	}
+	return parseNetshSubinterfaceMTU(string(out), windowsTailscaleAdapter)
+}
+
+// parseNetshSubinterfaceMTU extracts the MTU column from the `netsh interface ipv4
+// show subinterfaces` row whose trailing interface name matches adapter. Each data
+// row is "MTU MediaSenseState BytesIn BytesOut Interface", so the MTU is the first
+// field and the interface name is the remainder — matched on the trailing token
+// because a name can contain spaces.
+func parseNetshSubinterfaceMTU(out, adapter string) (int, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		name := strings.Join(fields[4:], " ")
+		if !strings.EqualFold(name, adapter) {
+			continue
+		}
+		if mtu, err := strconv.Atoi(fields[0]); err == nil {
+			return mtu, true
+		}
+	}
+	return 0, false
 }
 
 func (windowsPlatform) SupportsIPNBus() bool { return true }

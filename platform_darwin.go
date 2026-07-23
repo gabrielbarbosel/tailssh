@@ -135,6 +135,58 @@ func (darwinPlatform) SecureKeyFile(path string) error {
 // SupportsIPNBus is true on desktop macOS: `tailscale debug watch-ipn` works.
 func (darwinPlatform) SupportsIPNBus() bool { return true }
 
+// EnsureTailnetMTU lowers the Tailscale utun's MTU to tailnetSafeMTU when it is
+// higher. macOS names the interface utunN (the index varies), so it is found by the
+// tailnet address it carries rather than a fixed name. Setting a utun MTU needs
+// root, so a non-root daemon defers to a privileged run instead of prompting.
+func (p darwinPlatform) EnsureTailnetMTU() error {
+	name, cur, ok := darwinTailscaleInterface()
+	if !ok || cur <= tailnetSafeMTU {
+		return nil
+	}
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	return p.run("ifconfig", name, "mtu", strconv.Itoa(tailnetSafeMTU))
+}
+
+// tailnetMTU reports the current MTU of the Tailscale utun, or false when Tailscale
+// is down / no tailnet interface is present.
+func tailnetMTU() (int, bool) {
+	_, mtu, ok := darwinTailscaleInterface()
+	return mtu, ok
+}
+
+// darwinTailscaleInterface finds the Tailscale utun by the 100.64.0.0/10 CGNAT
+// address it carries — name-agnostic, since macOS assigns utunN dynamically — and
+// returns its name and MTU. The stdlib MTU matches what `ifconfig mtu` sets.
+func darwinTailscaleInterface() (name string, mtu int, ok bool) {
+	_, cgnat, err := net.ParseCIDR("100.64.0.0/10")
+	if err != nil {
+		return "", 0, false
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", 0, false
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, isNet := a.(*net.IPNet)
+			if !isNet {
+				continue
+			}
+			if ip4 := ipnet.IP.To4(); ip4 != nil && cgnat.Contains(ip4) {
+				return iface.Name, iface.MTU, true
+			}
+		}
+	}
+	return "", 0, false
+}
+
 // diskEncryption reports FileVault state via fdesetup (best-effort).
 func diskEncryption() (on bool, detail string) {
 	out, err := exec.Command("fdesetup", "status").Output()

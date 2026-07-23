@@ -310,6 +310,7 @@ func upProvision(pl Platform, r upReadiness) error {
 		return nil
 	}
 	enableTailscaleSSH(pl)
+	upEnsureTailnetMTU(pl)
 	upEnsureSSHAcceptRule()
 	upEnsureIdentity(pl)
 	upJoinMesh(pl)
@@ -349,6 +350,21 @@ func upEnsureNetwork(pl Platform, r *upReadiness) bool {
 		r.self, r.haveSelf = selfDevice(r.devices)
 	}
 	return true
+}
+
+// upEnsureTailnetMTU clamps the Tailscale interface MTU now, during provisioning, so
+// the very first connection over a broken-PMTU direct path (typically to a phone)
+// already works instead of stalling until the daemon's next MTU pass. Best-effort:
+// a failure never aborts the run, and it is a silent no-op where the MTU is already
+// fine or can't be set here (see EnsureTailnetMTU).
+func upEnsureTailnetMTU(pl Platform) {
+	if err := pl.EnsureTailnetMTU(); err != nil {
+		fmt.Printf("  mtu         : %v — continuing\n", err)
+		return
+	}
+	if mtu, ok := tailnetMTU(); ok {
+		fmt.Printf("  mtu         : ok (tailnet interface at %d)\n", mtu)
+	}
 }
 
 // upEnsureSSHAcceptRule ensures the tailnet's `ssh accept` policy rule when a

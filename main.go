@@ -271,10 +271,6 @@ func main() {
 		if err := runDaemon(selectPlatform()); err != nil {
 			fail(err)
 		}
-	case "fleet":
-		fmt.Println("fleet: sweeping the tailnet to onboard missing devices...")
-		fleetSweep(newOnboardState())
-		fmt.Println("fleet: sweep done.")
 	case "acl":
 		apply := false
 		for _, a := range os.Args[2:] {
@@ -294,7 +290,7 @@ func main() {
 			fail(err)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: tailssh (list | status | up [--yes] | sync | daemon | fleet | acl [--apply] | off | uninstall)")
+		fmt.Fprintln(os.Stderr, "usage: tailssh (list | status | up [--yes] | sync | daemon | acl [--apply] | off | uninstall)")
 		os.Exit(1)
 	}
 }

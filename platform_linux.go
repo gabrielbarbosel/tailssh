@@ -9,12 +9,17 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // linuxDaemonUnit is the systemd service name for the tailssh daemon.
 const linuxDaemonUnit = "tailssh-daemon.service"
+
+// linuxTailscaleLink is the kernel network interface Tailscale creates on Linux,
+// whose MTU tailssh reads from sysfs and sets with `ip link`.
+const linuxTailscaleLink = "tailscale0"
 
 // termuxDefaultPrefix is Termux's install prefix, used when $PREFIX is unset.
 const termuxDefaultPrefix = "/data/data/com.termux/files/usr"
@@ -519,6 +524,40 @@ func restoreSSHKeyLabels(dir, path string) {
 	}
 	_ = exec.Command("restorecon", dir).Run()
 	_ = exec.Command("restorecon", path).Run()
+}
+
+// EnsureTailnetMTU lowers the tailscale0 link MTU to tailnetSafeMTU when it is
+// higher. It is a no-op under Termux (the tun belongs to the Tailscale Android app,
+// which an unprivileged uid cannot reconfigure) and when this process is not root,
+// since lowering a link MTU needs CAP_NET_ADMIN — a non-root daemon defers to a
+// privileged run rather than shelling out to a sudo that would only prompt.
+func (p *linuxPlatform) EnsureTailnetMTU() error {
+	if p.termux {
+		return nil
+	}
+	cur, ok := tailnetMTU()
+	if !ok || cur <= tailnetSafeMTU {
+		return nil
+	}
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	return p.run("ip", "link", "set", linuxTailscaleLink, "mtu", strconv.Itoa(tailnetSafeMTU))
+}
+
+// tailnetMTU reads the tailscale0 link MTU from sysfs — the same value
+// EnsureTailnetMTU sets — needing no privilege. False when the interface is absent
+// (Tailscale down, or the app-managed tun under Termux, which has no sysfs entry).
+func tailnetMTU() (int, bool) {
+	b, err := os.ReadFile(filepath.Join("/sys/class/net", linuxTailscaleLink, "mtu"))
+	if err != nil {
+		return 0, false
+	}
+	mtu, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0, false
+	}
+	return mtu, true
 }
 
 // SupportsIPNBus is true on desktop/server Linux (`tailscale debug watch-ipn`

@@ -39,6 +39,15 @@ type Platform interface {
 	// authorized_keys file (Unix 600/700, SELinux restorecon, Windows ACL).
 	SecureKeyFile(path string) error
 
+	// EnsureTailnetMTU clamps this node's Tailscale interface MTU down to
+	// tailnetSafeMTU so large packets survive direct paths with a broken PMTU (see
+	// tailnetSafeMTU). It only ever lowers, never raises, and is idempotent: a no-op
+	// when the MTU is already at or below the target. It is also a no-op where the
+	// local Tailscale MTU cannot be set — Android/Termux (the tun belongs to the
+	// app) — or where doing so needs a privilege this process lacks (an unelevated
+	// Windows daemon, a non-root Linux/macOS daemon), leaving it to a privileged run.
+	EnsureTailnetMTU() error
+
 	// SupportsIPNBus reports whether `tailscale debug watch-ipn` is usable here.
 	// False on Android/Termux (app has no local CLI) → relay/receive model.
 	SupportsIPNBus() bool

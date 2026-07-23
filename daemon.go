@@ -147,12 +147,20 @@ func daemonResolveSelfIP() (string, error) {
 // belt-and-suspenders one on desktops. A CLI peer's roster push replaces our cached map,
 // which we adopt and re-sync so this node rebuilds ssh_config/authorized_keys against
 // the new peers.
+//
+// Adopting a roster also announces our presence. A CLI-less node (a phone) starts with
+// no roster, so its startup announce reaches no one and peers never learn it began
+// serving its key — a mesh-join raises no netmap event to wake them, so without this
+// they would not fetch its key until their next slow reconcile. Announcing the moment we
+// learn our peers closes that gap: every device, including one that was offline and just
+// came back, is picked up within the roster-push interval instead of up to a reconcile.
 func daemonStartKeyserver(pl Platform, selfIP, pubLine string, engine *syncEngine) (io.Closer, *debounce, error) {
 	resyncDebounce := newDebounce(2*time.Second, 10*time.Second, func() { engine.trigger(false) })
 	metaBytes, _ := json.Marshal(nodeMeta{User: localUsername(), OS: pl.Name(), Port: pl.SSHListenPort()})
 	adoptRoster := func(raw []byte) {
 		if changed, err := saveRosterCache(raw); err == nil && changed {
 			engine.trigger(false)
+			go daemonAnnouncePresence()
 		}
 	}
 	ks, err := startKeyserver(selfIP, pubLine, string(metaBytes), readHostKey(pl.SSHListenPort()), rosterJSON, resyncDebounce.arm, adoptRoster)

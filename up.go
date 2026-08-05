@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -81,10 +83,68 @@ func ensureTailscale(pl Platform) bool {
 		fmt.Println("  tailscale   : ready")
 		return true
 	}
+	if owner, locked := tailscaleForeignOwner(); locked {
+		printTailscaleOwnedElsewhere(owner)
+		return false
+	}
 	if ensureTailscaleAuthKeyJoin() {
 		return true
 	}
 	return ensureTailscaleInteractiveLogin()
+}
+
+// tailscaleForeignOwner reports the account that holds the tailscaled session when
+// it isn't the one running this process. tailscaled on Windows answers its LocalAPI
+// only for the account that owns the session; every other account gets a 401
+// "Tailscale already in use by DOMAIN\user" — a healthy daemon refusing a foreign
+// caller, not a login problem. Returns false wherever the lock can't happen
+// (non-Windows, no CLI, daemon down, same account).
+func tailscaleForeignOwner() (owner string, locked bool) {
+	bin, err := tailscaleBin()
+	if err != nil {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := exec.CommandContext(ctx, bin, "status", "--json").Output(); err != nil {
+		return parseTailscaleInUseBy(withStderr(err).Error())
+	}
+	return "", false
+}
+
+// parseTailscaleInUseBy extracts the owning account from tailscaled's cross-account
+// denial ("... Tailscale already in use by POA-AVEL-521\Admin, pid 28496").
+func parseTailscaleInUseBy(msg string) (owner string, locked bool) {
+	const marker = "already in use by "
+	i := strings.Index(msg, marker)
+	if i < 0 {
+		return "", false
+	}
+	owner = msg[i+len(marker):]
+	if j := strings.IndexAny(owner, ",\r\n"); j >= 0 {
+		owner = owner[:j]
+	}
+	owner = strings.TrimSpace(owner)
+	return owner, owner != ""
+}
+
+// printTailscaleOwnedElsewhere explains the cross-account state as what it is — a
+// healthy Tailscale owned by another account — and points at the fix. Attempting a
+// login from here would only reproduce the same denial, so the run stops instead,
+// before any per-user state (identity, config) is created under the wrong profile.
+func printTailscaleOwnedElsewhere(owner string) {
+	fmt.Printf("  tailscale   : running, but owned by account %q\n", owner)
+	fmt.Printf("                this process runs as %q — tailscaled only answers its owner\n", currentUserName())
+	fmt.Printf("                fix: open an elevated shell as %s and re-run: tailssh up --yes\n", owner)
+}
+
+// currentUserName names the account this process runs as (DOMAIN\user on Windows),
+// for identity-mismatch messages.
+func currentUserName() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return os.Getenv("USERNAME")
 }
 
 // ensureTailscaleTermux brings the network up on Android/Termux, which has no
@@ -202,14 +262,15 @@ func ensureSSH(pl Platform) bool {
 // discovery, sshd state, and the app identity key. It seeds both the read-only
 // plan and the provisioning flow, which refreshes it as stages bring pieces up.
 type upReadiness struct {
-	devices   []device
-	self      device
-	haveSelf  bool
-	discErr   error
-	installed bool
-	running   bool
-	keyPath   string
-	keyOK     bool
+	devices      []device
+	self         device
+	haveSelf     bool
+	discErr      error
+	foreignOwner string // account holding tailscaled when it isn't ours
+	installed    bool
+	running      bool
+	keyPath      string
+	keyOK        bool
 }
 
 // runUp audits the local device, prints a readiness report, and — only under
@@ -234,7 +295,12 @@ func upAuditDevice(pl Platform) upReadiness {
 
 	r.devices, r.discErr = discover()
 	if r.discErr != nil {
-		fmt.Printf("  tailscale   : MISSING (%v)\n", r.discErr)
+		if owner, locked := parseTailscaleInUseBy(r.discErr.Error()); locked {
+			r.foreignOwner = owner
+			fmt.Printf("  tailscale   : running, owned by another account (%s)\n", owner)
+		} else {
+			fmt.Printf("  tailscale   : MISSING (%v)\n", r.discErr)
+		}
 	} else {
 		r.self, r.haveSelf = selfDevice(r.devices)
 		if r.haveSelf {
@@ -271,7 +337,9 @@ func upPrintPlan(r upReadiness) {
 		return
 	}
 	fmt.Println("tailssh up would:")
-	if r.discErr != nil {
+	if r.foreignOwner != "" {
+		fmt.Printf("  - nothing — Tailscale is healthy but owned by %s; re-run tailssh as that account\n", r.foreignOwner)
+	} else if r.discErr != nil {
 		fmt.Println("  - install Tailscale and run `tailscale up` (required prerequisite)")
 	}
 	if !r.installed {

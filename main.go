@@ -104,7 +104,7 @@ func discoverCLI() ([]device, error) {
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, "status", "--json").Output()
 	if err != nil {
-		return nil, fmt.Errorf("tailscale status failed: %w", err)
+		return nil, fmt.Errorf("tailscale status failed: %w", withStderr(err))
 	}
 	var st status
 	if err := json.Unmarshal(out, &st); err != nil {

@@ -20,6 +20,30 @@ func TestValidSSHUser(t *testing.T) {
 	}
 }
 
+func TestParseTailscaleInUseBy(t *testing.T) {
+	locked := map[string]string{
+		`failed to connect to local tailscaled (which appears to be running as tailscaled.exe, pid 5580). Got error: 401 Unauthorized: Tailscale already in use by POA-AVEL-521\Admin, pid 28496`: `POA-AVEL-521\Admin`,
+		"tailscale status failed: exit status 1: Got error: 401 Unauthorized: Tailscale already in use by HOST\\user":                                                                             `HOST\user`,
+	}
+	for in, want := range locked {
+		owner, ok := parseTailscaleInUseBy(in)
+		if !ok || owner != want {
+			t.Errorf("parseTailscaleInUseBy(%q) = (%q, %v), want (%q, true)", in, owner, ok, want)
+		}
+	}
+	free := []string{
+		"",
+		"tailscale status failed: exit status 1",
+		"Logged out.",
+		"already in use by ", // marker with no owner
+	}
+	for _, in := range free {
+		if owner, ok := parseTailscaleInUseBy(in); ok {
+			t.Errorf("parseTailscaleInUseBy(%q) = (%q, true), want locked=false", in, owner)
+		}
+	}
+}
+
 func TestSSHConfigUser(t *testing.T) {
 	cases := map[string]string{
 		"ubuntu":    "ubuntu",

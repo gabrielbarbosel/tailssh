@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,4 +69,19 @@ func command(name string, args ...string) *exec.Cmd {
 // exec.CommandContext.
 func commandContext(ctx context.Context, name string, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, lookExecutable(name), args...)
+}
+
+// withStderr enriches an *exec.ExitError with the child's captured stderr, leaving
+// any other error (or nil) untouched. Output()-style calls capture stderr but their
+// default message ("exit status N") drops it — without this, a child's actual
+// diagnosis (a PowerShell cmdlet fault, tailscaled's LocalAPI denial) never reaches
+// the user.
+func withStderr(err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if msg := strings.TrimSpace(string(exitErr.Stderr)); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+	}
+	return err
 }

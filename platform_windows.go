@@ -62,11 +62,15 @@ func (p windowsPlatform) InstallTailscale() error {
 
 func (windowsPlatform) Name() string { return "windows" }
 
-// windowsPowershell runs a PowerShell command and returns trimmed stdout.
+// windowsPowershell runs a PowerShell command and returns trimmed stdout. On
+// failure the error carries the child's stderr, which *exec.ExitError captures but
+// whose default message ("exit status N") drops — without it a cmdlet fault such as
+// the servicing stack's "pending operations" reaches the caller as a bare "exit
+// status 1", undiagnosable.
 func windowsPowershell(script string) (string, error) {
 	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive",
 		"-Command", script).Output()
-	return strings.TrimSpace(string(out)), err
+	return strings.TrimSpace(string(out)), withStderr(err)
 }
 
 // windowsIsElevated reports whether this process runs with an elevated token —
@@ -114,16 +118,59 @@ func (windowsPlatform) SSHState() (installed, running bool) {
 // public networks.
 const windowsTailnetCGNATRange = "100.64.0.0/10"
 
-// InstallSSH installs the OpenSSH server capability and opens the firewall for
-// inbound TCP 22. Both steps are idempotent. Host keys come from the capability,
-// so no ssh-keygen is needed here.
+// windowsOpenSSHWingetID is the winget package that installs the OpenSSH server
+// outside the Windows Update Features-on-Demand channel — the fallback path when the
+// capability install can't reach its source (a WSUS-scoped machine).
+const windowsOpenSSHWingetID = "Microsoft.OpenSSH.Beta"
+
+// InstallSSH installs the OpenSSH server and opens the firewall for inbound TCP 22.
+// The capability is the primary source (host keys and the stock sshd_config come with
+// it); winget is a source-independent fallback for machines whose Features-on-Demand
+// channel is unreachable. Both steps are idempotent.
 func (windowsPlatform) InstallSSH() error {
-	if _, err := windowsPowershell(
-		"Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"); err != nil {
-		return fmt.Errorf("add OpenSSH.Server capability: %w", err)
+	if err := windowsAddOpenSSHCapability(); err != nil {
+		if wingetErr := windowsInstallOpenSSHViaWinget(); wingetErr != nil {
+			return windowsOpenSSHInstallError(err, wingetErr)
+		}
 	}
 	windowsOpenTailnetFirewall()
 	return nil
+}
+
+// windowsAddOpenSSHCapability installs the OpenSSH.Server Feature-on-Demand.
+// ErrorActionPreference=Stop turns the cmdlet's non-terminating faults into a
+// non-zero exit, so a failed install can't be mistaken for success.
+func windowsAddOpenSSHCapability() error {
+	_, err := windowsPowershell("$ErrorActionPreference='Stop'; " +
+		"Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0")
+	return err
+}
+
+// windowsInstallOpenSSHViaWinget installs the OpenSSH server through winget, whose
+// source is independent of Windows Update — so it still works where the capability
+// install cannot reach WSUS/Windows Update. Absent winget is itself the error.
+func windowsInstallOpenSSHViaWinget() error {
+	if _, err := exec.LookPath("winget"); err != nil {
+		return fmt.Errorf("winget not available")
+	}
+	out, err := exec.Command("winget", "install", "-e", "--id", windowsOpenSSHWingetID,
+		"--silent", "--accept-package-agreements", "--accept-source-agreements").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// windowsOpenSSHInstallError explains a total install failure. A pending servicing
+// operation is surfaced on its own because its fix is a reboot, not a retry — every
+// component install stays blocked until Windows finishes the operation it owes.
+func windowsOpenSSHInstallError(capErr, wingetErr error) error {
+	if strings.Contains(strings.ToLower(capErr.Error()), "pending operation") {
+		return fmt.Errorf("a Windows servicing operation is pending — reboot to "+
+			"complete it, then re-run tailssh: %w", capErr)
+	}
+	return fmt.Errorf("install OpenSSH server via both capability and winget: "+
+		"%w; winget: %v", capErr, wingetErr)
 }
 
 // windowsOpenTailnetFirewall adds an idempotent inbound rule allowing TCP 22 only

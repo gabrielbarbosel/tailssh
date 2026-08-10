@@ -94,6 +94,23 @@ func discover() ([]device, error) {
 	return discoverCLIless()
 }
 
+// validateSelfOwner rejects a status whose User map does not resolve the local
+// node's owner. Ownership is what syncTrustedPeers compares every peer against, and
+// the lookup that derives it is a plain map index: a missing entry yields the zero
+// value, so a degraded read silently reports every device — self included — as
+// owner-less. That reads as "no peer is mine", which regenerates the managed blocks
+// from an empty trusted set and prunes every Host entry and authorized key. The read
+// either resolves the local owner or it is not a usable view of the tailnet.
+func validateSelfOwner(st status) error {
+	if st.Self == nil {
+		return fmt.Errorf("tailscale status has no self node")
+	}
+	if st.User[fmt.Sprint(st.Self.UserID)].LoginName == "" {
+		return fmt.Errorf("tailscale status resolves no owner for the local node (UserID %v, %d profiles): refusing a degraded read", st.Self.UserID, len(st.User))
+	}
+	return nil
+}
+
 // discoverCLI reads the tailnet directly from the local `tailscale status --json`.
 func discoverCLI() ([]device, error) {
 	bin, err := tailscaleBin()
@@ -108,6 +125,9 @@ func discoverCLI() ([]device, error) {
 	}
 	var st status
 	if err := json.Unmarshal(out, &st); err != nil {
+		return nil, err
+	}
+	if err := validateSelfOwner(st); err != nil {
 		return nil, err
 	}
 

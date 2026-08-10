@@ -122,3 +122,57 @@ func TestEnsureSSHRule(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateSelfOwner(t *testing.T) {
+	self := &node{StableID: "nSelf", DNSName: "pc.example.ts.net.", UserID: 7}
+	t.Run("resolvable owner passes", func(t *testing.T) {
+		st := status{Self: self, User: map[string]userProfile{"7": {LoginName: "me@example.com"}}}
+		if err := validateSelfOwner(st); err != nil {
+			t.Errorf("validateSelfOwner rejected a complete status: %v", err)
+		}
+	})
+	t.Run("status with no user profiles is refused", func(t *testing.T) {
+		if err := validateSelfOwner(status{Self: self}); err == nil {
+			t.Error("validateSelfOwner accepted a status whose User map cannot resolve the local owner")
+		}
+	})
+	t.Run("profiles present but none matching self is refused", func(t *testing.T) {
+		st := status{Self: self, User: map[string]userProfile{"9": {LoginName: "other@example.com"}}}
+		if err := validateSelfOwner(st); err == nil {
+			t.Error("validateSelfOwner accepted a status with no profile for the local UserID")
+		}
+	})
+	t.Run("missing self node is refused", func(t *testing.T) {
+		if err := validateSelfOwner(status{User: map[string]userProfile{"7": {LoginName: "me@example.com"}}}); err == nil {
+			t.Error("validateSelfOwner accepted a status with no self node")
+		}
+	})
+}
+
+func TestSyncTrustedPeers(t *testing.T) {
+	self := device{name: "pc", ip: "100.0.0.1", owner: "me@example.com", self: true}
+	peers := []device{
+		self,
+		{name: "vm", ip: "100.0.0.2", owner: "me@example.com"},
+		{name: "theirs", ip: "100.0.0.3", owner: "other@example.com"},
+		{name: "noaddr", owner: "me@example.com"},
+	}
+	t.Run("keeps same-owner addressable peers only", func(t *testing.T) {
+		owned, err := syncTrustedPeers(peers, self)
+		if err != nil {
+			t.Fatalf("syncTrustedPeers failed on a valid tailnet: %v", err)
+		}
+		if len(owned) != 1 || owned[0].name != "vm" {
+			t.Errorf("syncTrustedPeers = %v, want just vm", owned)
+		}
+	})
+	t.Run("unknown local owner is an error, not an empty prune set", func(t *testing.T) {
+		owned, err := syncTrustedPeers(peers, device{name: "pc", ip: "100.0.0.1", self: true})
+		if err == nil {
+			t.Fatalf("syncTrustedPeers accepted an owner-less local node, returning %v — a pass would prune every peer", owned)
+		}
+		if owned != nil {
+			t.Errorf("syncTrustedPeers returned peers alongside an error: %v", owned)
+		}
+	})
+}

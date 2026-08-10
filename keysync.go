@@ -73,11 +73,12 @@ func selfDevice(devs []device) (device, bool) {
 	return device{}, false
 }
 
-// runSync performs one full key-exchange pass. It returns an error only when the
-// tailnet membership can't be read (discover failed) — with no live membership no
-// managed block is touched, so a blind pass can never prune a peer. Per-peer and
-// per-file problems are logged and tolerated so a single flaky peer never fails the
-// sync.
+// runSync performs one full key-exchange pass. It returns before writing anything
+// when the tailnet membership can't be trusted — discover failed, or it succeeded but
+// resolved no owner for this node — so a blind pass can never prune a peer. Both
+// checks are needed: a read can fail outright, or come back well-formed yet missing
+// the one field that makes it meaningful. Per-peer and per-file problems are logged
+// and tolerated so a single flaky peer never fails the sync.
 func runSync(pl Platform) error {
 	defer debug.FreeOSMemory()
 
@@ -90,7 +91,10 @@ func runSync(pl Platform) error {
 		return fmt.Errorf("sync: no self device in tailnet status")
 	}
 
-	owned := syncTrustedPeers(devs, self)
+	owned, err := syncTrustedPeers(devs, self)
+	if err != nil {
+		return err
+	}
 	keyed := syncMergePeerCache(owned, fetchPeerKeys(owned), loadPeers(), time.Now().UTC())
 
 	var firstErr error
@@ -125,19 +129,27 @@ func runSync(pl Platform) error {
 // syncTrustedPeers is the set one sync pass may authorize: same-owner, addressable
 // peers present in this successful discover(). Peers absent from it are pruned (they
 // left the tailnet or changed owner); other owners are excluded entirely.
-func syncTrustedPeers(devs []device, self device) []device {
+//
+// An unknown local owner is an error rather than an empty set. Every peer is trusted
+// by comparison against it, so treating it as "matches nothing" turns one unreadable
+// field into a total prune of the managed blocks — the failure mode this guard exists
+// to prevent. Callers must abort the pass instead of writing that result.
+func syncTrustedPeers(devs []device, self device) ([]device, error) {
+	if self.owner == "" {
+		return nil, fmt.Errorf("sync: local node %q has no owner: refusing to evaluate peer trust against an unknown owner", self.name)
+	}
 	var owned []device
 	for _, d := range devs {
 		if d.self || d.ip == "" {
 			continue
 		}
-		if self.owner == "" || d.owner != self.owner {
+		if d.owner != self.owner {
 			continue
 		}
 		owned = append(owned, d)
 	}
 	sort.Slice(owned, func(i, j int) bool { return owned[i].name < owned[j].name })
-	return owned
+	return owned, nil
 }
 
 // syncMergePeerCache folds this pass's fetches into the on-disk cache, one entry per

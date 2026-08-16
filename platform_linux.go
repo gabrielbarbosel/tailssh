@@ -743,3 +743,59 @@ func (p *linuxPlatform) removeTermuxDaemon() error {
 	}
 	return nil
 }
+
+// MountSupport: Linux serves (sshd) and mounts (sshfs) — except Termux, which has no
+// root FUSE and so can only serve its own files to the mesh, never mount peers'.
+func (p *linuxPlatform) MountSupport() (canExport, canMount bool) {
+	return true, !p.termux
+}
+
+// EnsureMountTooling installs sshfs when missing (never under Termux). Idempotent.
+func (p *linuxPlatform) EnsureMountTooling() error {
+	if p.termux || haveExecutable("sshfs") {
+		return nil
+	}
+	return p.installSSHFSPackage()
+}
+
+// installSSHFSPackage installs sshfs through the first available package manager,
+// mirroring installOpenSSHServerPackage.
+func (p *linuxPlatform) installSSHFSPackage() error {
+	switch {
+	case have("apt-get"):
+		_ = p.run("apt-get", "update")
+		return p.run("env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "sshfs")
+	case have("dnf"):
+		return p.run("dnf", "install", "-y", "fuse-sshfs")
+	case have("yum"):
+		return p.run("yum", "install", "-y", "fuse-sshfs")
+	case have("pacman"):
+		return p.run("pacman", "-Sy", "--noconfirm", "sshfs")
+	case have("apk"):
+		return p.run("apk", "add", "sshfs")
+	case have("zypper"):
+		return p.run("zypper", "--non-interactive", "install", "sshfs")
+	default:
+		return fmt.Errorf("no supported package manager (apt/dnf/yum/pacman/apk/zypper) found for sshfs")
+	}
+}
+
+// MountPeer mounts spec's filesystem read-write under <config>/tailssh/mnt/<peer>.
+func (p *linuxPlatform) MountPeer(spec mountSpec, prevAt string) (string, error) {
+	at := prevAt
+	if at == "" {
+		at = unixMountpoint(spec.Name)
+	}
+	return at, sshfsMount(spec, at)
+}
+
+// UnmountPeer detaches the FUSE mount at `at` via fusermount.
+func (p *linuxPlatform) UnmountPeer(at string) error {
+	if !pathIsMountpoint(at) {
+		return nil
+	}
+	if out, err := command("fusermount", "-u", at).CombinedOutput(); err != nil {
+		return fmt.Errorf("fusermount -u %s: %v: %s", at, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

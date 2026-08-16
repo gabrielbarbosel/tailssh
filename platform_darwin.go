@@ -308,3 +308,43 @@ func (p darwinPlatform) RemoveDaemon() error {
 	}
 	return nil
 }
+
+// MountSupport: macOS can serve (Remote Login) and mount (macFUSE + sshfs).
+func (darwinPlatform) MountSupport() (canExport, canMount bool) { return true, true }
+
+// EnsureMountTooling best-effort installs macFUSE + sshfs via Homebrew. macFUSE needs
+// a user-approved kernel extension, which cannot be automated — so on a fresh box
+// this returns a clear error naming the manual approval step rather than pretending.
+func (darwinPlatform) EnsureMountTooling() error {
+	if haveExecutable("sshfs") {
+		return nil
+	}
+	if haveExecutable("brew") {
+		_ = command("brew", "install", "--cask", "macfuse").Run()
+		_ = command("brew", "install", "gromgit/fuse/sshfs-mac").Run()
+	}
+	if !haveExecutable("sshfs") {
+		return fmt.Errorf("sshfs unavailable: install macFUSE + sshfs and approve the macFUSE kernel extension in System Settings › Privacy & Security")
+	}
+	return nil
+}
+
+// MountPeer mounts spec's filesystem read-write under <config>/tailssh/mnt/<peer>.
+func (darwinPlatform) MountPeer(spec mountSpec, prevAt string) (string, error) {
+	at := prevAt
+	if at == "" {
+		at = unixMountpoint(spec.Name)
+	}
+	return at, sshfsMount(spec, at)
+}
+
+// UnmountPeer detaches the macFUSE mount at `at`.
+func (darwinPlatform) UnmountPeer(at string) error {
+	if !pathIsMountpoint(at) {
+		return nil
+	}
+	if out, err := command("umount", at).CombinedOutput(); err != nil {
+		return fmt.Errorf("umount %s: %v: %s", at, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

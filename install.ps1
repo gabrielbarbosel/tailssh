@@ -37,10 +37,21 @@ $url = "https://github.com/$repo/releases/latest/download/$bin"
 $dir = "$env:ProgramFiles\tailssh"
 $dest = "$dir\tailssh.exe"
 New-Item -ItemType Directory -Force $dir | Out-Null
+
+# Stop any running instance first: Windows locks a running .exe, so an in-place
+# upgrade fails to overwrite it otherwise. The `up --yes` below re-arms the daemon.
+Get-ScheduledTask -TaskName 'tailssh' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue
+Get-Process -Name 'tailssh' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 500
+
 Say "downloading $bin..."
 # Force TLS 1.2 so Invoke-WebRequest works on PowerShell 5.1 hosts (default may be SSL3/TLS1.0).
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -Uri $url -OutFile $dest
+# Download beside the target then move into place, so a failed download never leaves
+# a half-written binary at $dest.
+$tmp = "$dest.new"
+Invoke-WebRequest -Uri $url -OutFile $tmp
+Move-Item -Force -Path $tmp -Destination $dest
 
 # Put tailssh on the machine PATH (idempotent).
 # Write the registry value directly with -Type ExpandString: the .NET

@@ -129,8 +129,15 @@ func freeDriveLetter() string {
 }
 
 // writeRclonePeerConfig writes a self-contained rclone config for one peer (an sftp
-// remote named after the peer, keyed by the mesh identity + known_hosts) and returns
-// its path. Written atomically under the tailssh config dir; no shared file to merge.
+// remote named after the peer, keyed by the mesh identity) and returns its path.
+// Written atomically under the tailssh config dir; no shared file to merge.
+//
+// It deliberately does NOT pin a known_hosts file: rclone verifies host keys
+// strictly with no accept-new, so a stale managed entry would hard-fail the mount
+// (whereas sshfs's accept-new tolerates it). The peer's identity is already
+// authenticated by WireGuard — tailnet membership is the authorization boundary, the
+// same reason the keyserver serves plain HTTP — so host-key pinning here adds nothing
+// over the encrypted, authenticated tunnel the traffic already rides.
 func writeRclonePeerConfig(spec mountSpec) (string, error) {
 	path := filepath.Join(filepath.Dir(appKeyPath()), "rclone", "peer-"+spec.Name+".conf")
 	var b strings.Builder
@@ -140,7 +147,6 @@ func writeRclonePeerConfig(spec mountSpec) (string, error) {
 	fmt.Fprintf(&b, "user = %s\n", spec.User)
 	fmt.Fprintf(&b, "port = %d\n", spec.Port)
 	fmt.Fprintf(&b, "key_file = %s\n", spec.Identity)
-	fmt.Fprintf(&b, "known_hosts_file = %s\n", spec.KnownHosts)
 	fmt.Fprintf(&b, "md5sum_command = none\n")
 	fmt.Fprintf(&b, "sha1sum_command = none\n")
 	out := []byte(b.String())

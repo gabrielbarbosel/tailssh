@@ -348,3 +348,6 @@ func (darwinPlatform) UnmountPeer(at string) error {
 	}
 	return nil
 }
+
+// ReplaceSelf swaps this node's executable with a new release binary (inode swap).
+func (darwinPlatform) ReplaceSelf(data []byte) error { return replaceExecutable(data) }

@@ -287,6 +287,10 @@ func main() {
 		if err := runSyncCommand(selectPlatform()); err != nil {
 			fail(err)
 		}
+	case "update":
+		if err := runUpdate(selectPlatform()); err != nil {
+			fail(err)
+		}
 	case "daemon":
 		if err := runDaemon(selectPlatform()); err != nil {
 			fail(err)
@@ -310,7 +314,7 @@ func main() {
 			fail(err)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: tailssh (list | status | up [--yes] | sync | daemon | acl [--apply] | off | uninstall)")
+		fmt.Fprintln(os.Stderr, "usage: tailssh (list | status | up [--yes] | sync | update | daemon | acl [--apply] | off | uninstall)")
 		os.Exit(1)
 	}
 }

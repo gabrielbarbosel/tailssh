@@ -85,6 +85,11 @@ type Platform interface {
 	// UnmountPeer tears down the mount at `at` (drive letter or directory). Idempotent.
 	UnmountPeer(at string) error
 
+	// ReplaceSelf overwrites the running executable's on-disk file with data (a new
+	// release binary), the OS-correct way: an inode swap on Unix, or rename-aside +
+	// rewrite on Windows (which locks a running image). The caller restarts afterward.
+	ReplaceSelf(data []byte) error
+
 	// EnsurePrivilege guarantees the process can perform the privileged provisioning
 	// steps (write the system-wide authorized_keys, register a boot service). When it
 	// re-launches the current command elevated to obtain them, it reports handled=true

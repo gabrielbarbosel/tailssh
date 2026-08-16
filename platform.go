@@ -65,6 +65,26 @@ type Platform interface {
 	// RemoveDaemon uninstalls the daemon service.
 	RemoveDaemon() error
 
+	// MountSupport reports whether this node can serve its files to the mesh
+	// (canExport — true wherever sshd/SFTP runs) and mount peers' filesystems
+	// locally (canMount — false where there is no usable FUSE, e.g. Termux).
+	MountSupport() (canExport, canMount bool)
+
+	// EnsureMountTooling installs the client needed to mount a peer (sshfs, or
+	// rclone + WinFsp on Windows), the way InstallSSH provisions the server.
+	// Idempotent and best-effort.
+	EnsureMountTooling() error
+
+	// MountPeer mounts spec's whole filesystem read-write as a local network unit and
+	// returns the mountpoint used — a drive letter like "Z:" on Windows, a directory
+	// on Unix. prevAt is the mountpoint from the previous pass ("" if none), reused
+	// when still valid so a peer keeps a stable location. Idempotent: a no-op
+	// returning prevAt when that mount is already live. Nothing is cached to disk.
+	MountPeer(spec mountSpec, prevAt string) (at string, err error)
+
+	// UnmountPeer tears down the mount at `at` (drive letter or directory). Idempotent.
+	UnmountPeer(at string) error
+
 	// EnsurePrivilege guarantees the process can perform the privileged provisioning
 	// steps (write the system-wide authorized_keys, register a boot service). When it
 	// re-launches the current command elevated to obtain them, it reports handled=true

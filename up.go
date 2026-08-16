@@ -379,6 +379,7 @@ func upProvision(pl Platform, r upReadiness) error {
 	}
 	enableTailscaleSSH(pl)
 	upEnsureTailnetMTU(pl)
+	upEnsureMountTooling(pl)
 	upEnsureSSHAcceptRule()
 	upEnsureIdentity(pl)
 	upJoinMesh(pl)
@@ -433,6 +434,24 @@ func upEnsureTailnetMTU(pl Platform) {
 	if mtu, ok := tailnetMTU(); ok {
 		fmt.Printf("  mtu         : ok (tailnet interface at %d)\n", mtu)
 	}
+}
+
+// upEnsureMountTooling installs the file-mesh mount client (sshfs, or rclone+WinFsp)
+// during provisioning, the way ensureSSH provisions the server, so a peer's files can
+// appear as a network unit right after setup. Best-effort: a failure (or a serve-only
+// node like Termux) never aborts the run.
+func upEnsureMountTooling(pl Platform) {
+	if canExport, canMount := pl.MountSupport(); !canMount {
+		if canExport {
+			fmt.Println("  mounts      : serve-only on this OS (files shared to the mesh; peers not mounted here)")
+		}
+		return
+	}
+	if err := pl.EnsureMountTooling(); err != nil {
+		fmt.Printf("  mounts      : %v — continuing\n", err)
+		return
+	}
+	fmt.Println("  mounts      : ok (peer filesystems will mount as network units)")
 }
 
 // upEnsureSSHAcceptRule ensures the tailnet's `ssh accept` policy rule when a

@@ -15,6 +15,10 @@ func runOff(pl Platform) error {
 	} else {
 		fmt.Println("  daemon    : off (service stopped & removed)")
 	}
+	// With the daemon gone, nothing maintains the peer mounts — detach them so no
+	// dangling network unit is left behind (identity/keys stay; `up` re-mounts).
+	unmountAll(pl)
+	fmt.Println("  mounts    : detached")
 	fmt.Println("tailssh is off — identity and authorized keys kept. `tailssh up` turns it back on.")
 	return nil
 }
@@ -30,6 +34,8 @@ func runUninstall(pl Platform) error {
 		fmt.Println("  daemon         : removed")
 	}
 
+	unmountAll(pl)
+	fmt.Println("  mounts         : detached")
 	adminRevokeInboundAccess(pl)
 	adminClearSSHConfig()
 	adminRemoveIdentityCache()

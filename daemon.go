@@ -101,9 +101,11 @@ func runDaemon(pl Platform) error {
 
 	log.Printf("daemon: %s up on %s (ipn-bus=%v)", pl.Name(), selfIP, pl.SupportsIPNBus())
 
+	cleanupUpdateLeftovers()
 	engine.trigger(false)
 	daemonAnnouncePresence()
 	daemonStartSeedLoops(ctx, pl)
+	go daemonAutoUpdateLoop(ctx, pl)
 
 	if pl.SupportsIPNBus() {
 		watchIPN(ctx, engine)

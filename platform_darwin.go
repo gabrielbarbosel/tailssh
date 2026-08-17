@@ -278,6 +278,10 @@ func darwinUnloadLaunchAgent(target, plistPath string) {
 	}
 }
 
+// EnsureDaemonPersistence: nothing to repair — launchd's KeepAlive already revives
+// the daemon after any exit.
+func (p darwinPlatform) EnsureDaemonPersistence() error { return nil }
+
 // InstallDaemon writes a per-user LaunchAgent plist and loads it. Running as the
 // logged-in user keeps authorized_keys owned correctly and avoids root/TCC.
 func (p darwinPlatform) InstallDaemon(exePath string) error {

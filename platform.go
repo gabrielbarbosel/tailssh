@@ -64,6 +64,13 @@ type Platform interface {
 	InstallDaemon(exePath string) error
 	// RemoveDaemon uninstalls the daemon service.
 	RemoveDaemon() error
+	// EnsureDaemonPersistence repairs this node's daemon registration so an exited
+	// daemon is always revived — called by the daemon at startup, so the whole fleet
+	// converges through auto-update with no manual reinstall. A no-op where the
+	// service manager already guarantees revival (systemd Restart=always, launchd
+	// KeepAlive, the Termux supervisor loop); on Windows it upgrades a legacy
+	// scheduled task to the watchdog registration.
+	EnsureDaemonPersistence() error
 
 	// MountSupport reports whether this node can serve its files to the mesh
 	// (canExport — true wherever sshd/SFTP runs) and mount peers' filesystems

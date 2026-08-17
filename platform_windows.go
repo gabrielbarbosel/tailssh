@@ -492,30 +492,71 @@ func sshHostKeyPubPath() string {
 // below allows battery start/continue, removes the time limit, and auto-restarts
 // the daemon if it crashes.
 func (p windowsPlatform) InstallDaemon(exePath string) error {
-	out, err := windowsPowershell(windowsDaemonTaskScript(exePath))
+	out, err := windowsPowershell(windowsDaemonRegisterScript(exePath) +
+		";Start-ScheduledTask -TaskName '" + windowsSvcName + "'")
 	if err == nil {
 		return nil
 	}
 	return p.installDaemonFallback(exePath, err, out)
 }
 
-// windowsDaemonTaskScript builds the PowerShell that idempotently registers (via
-// -Force, which overwrites any existing task) and starts the tailssh daemon
-// scheduled task. RunLevel Highest requires elevation, so running the script
-// succeeds only from an elevated process.
-func windowsDaemonTaskScript(exePath string) string {
+// windowsDaemonRegisterScript builds the PowerShell that idempotently registers the
+// tailssh daemon scheduled task (via -Force, which overwrites any existing task).
+// RunLevel Highest requires elevation, so running the script succeeds only from an
+// elevated process.
+//
+// Persistence is two-layered so the daemon is revived after ANY exit, matching the
+// mesh's premise that a node is reachable whenever Tailscale is:
+//   - RestartCount/RestartInterval revives a crashed daemon within a minute. The
+//     count looks finite but is a per-incident budget, not a lifetime one;
+//   - the $tick trigger is the backstop for everything restart-on-failure cannot
+//     see — a clean exit, a kill, an exhausted restart budget: it re-fires the task
+//     every 5 minutes forever, a no-op while an instance is running (the default
+//     IgnoreNew policy) and a relaunch when none is. A double start that slips
+//     through (an orphaned instance the task lost track of) is resolved by the
+//     daemon's own single-instance probe, which exits the newcomer cleanly.
+//
+// StartWhenAvailable makes a tick missed while asleep fire on wake instead of
+// waiting out the next interval.
+func windowsDaemonRegisterScript(exePath string) string {
 	psq := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
 	return "$ErrorActionPreference='Stop';" +
 		"$a=New-ScheduledTaskAction -Execute '" + psq(exePath) + "' -Argument 'daemon';" +
-		"$t=New-ScheduledTaskTrigger -AtLogOn;" +
+		"$logon=New-ScheduledTaskTrigger -AtLogOn;" +
+		"$tick=New-ScheduledTaskTrigger -Once -At (Get-Date)" +
+		" -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue);" +
 		"$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries" +
-		" -ExecutionTimeLimit ([TimeSpan]::Zero)" +
-		" -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1);" +
+		" -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable" +
+		" -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1);" +
 		"$p=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name)" +
 		" -LogonType S4U -RunLevel Highest;" +
-		"Register-ScheduledTask -TaskName '" + windowsSvcName + "' -Action $a -Trigger $t" +
-		" -Settings $s -Principal $p -Force | Out-Null;" +
-		"Start-ScheduledTask -TaskName '" + windowsSvcName + "'"
+		"Register-ScheduledTask -TaskName '" + windowsSvcName + "' -Action $a -Trigger $logon,$tick" +
+		" -Settings $s -Principal $p -Force | Out-Null"
+}
+
+// EnsureDaemonPersistence upgrades an older task registration in place: pre-watchdog
+// installs had only restart-on-failure with a 3-attempt budget, so a daemon that
+// kept exiting (or exited cleanly) stayed down until the next logon. Detection is
+// the watchdog's repetition interval — present means current, absent means legacy —
+// so the steady-state call is one read. The daemon calls this at startup, which is
+// how already-installed nodes converge to the watchdog via auto-update alone. A
+// run-key node (standard account, no task) has nothing to upgrade here.
+func (p windowsPlatform) EnsureDaemonPersistence() error {
+	out, err := windowsPowershell(
+		"(Get-ScheduledTask -TaskName '" + windowsSvcName + "' -ErrorAction Stop).Triggers" +
+			" | ForEach-Object { $_.Repetition.Interval }")
+	if err != nil {
+		return nil // no scheduled task (run-key mode) — nothing to upgrade
+	}
+	if strings.TrimSpace(out) != "" {
+		return nil // watchdog trigger already present
+	}
+	exe, err := selfExe()
+	if err != nil {
+		return err
+	}
+	_, err = windowsPowershell(windowsDaemonRegisterScript(exe))
+	return err
 }
 
 // installDaemonFallback handles a failed scheduled-task registration (the elevated

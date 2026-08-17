@@ -83,6 +83,11 @@ func runDaemon(pl Platform) error {
 		return fmt.Errorf("identity: %w", err)
 	}
 
+	if daemonAlreadyRunning(pubLine) {
+		log.Printf("daemon: another instance already serves this node's key — exiting so it stays the only one")
+		return nil
+	}
+
 	engine := &syncEngine{pl: pl}
 
 	ks, ksDebounce := daemonNewKeyserverSupervisor(pl, pubLine, engine)
@@ -96,6 +101,9 @@ func runDaemon(pl Platform) error {
 	log.Printf("daemon: %s up (ipn-bus=%v)", pl.Name(), pl.SupportsIPNBus())
 
 	cleanupUpdateLeftovers()
+	if err := pl.EnsureDaemonPersistence(); err != nil {
+		log.Printf("daemon: persistence: %v", err)
+	}
 	engine.trigger(false)
 	daemonAnnouncePresence()
 	daemonStartSeedLoops(ctx, pl)
@@ -111,6 +119,25 @@ func runDaemon(pl Platform) error {
 
 	log.Printf("daemon: shutting down")
 	return nil
+}
+
+// daemonAlreadyRunning reports whether another live daemon on this device is already
+// serving this node's public key — the single-instance guard. The Windows watchdog
+// trigger (or a logon firing both a task and a leftover Run key) can start a second
+// daemon while a healthy one holds the keyserver port; the newcomer detects the
+// incumbent by fetching /pubkey on the tailnet IP and comparing keys, then exits 0 so
+// the service manager records a clean no-op instead of a failure. Comparing the key —
+// not just port liveness — means a foreign process squatting on the port does NOT
+// make the daemon bow out.
+func daemonAlreadyRunning(pubLine string) bool {
+	ip, err := daemonResolveSelfIP()
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	line, err := fetchPubkey(ctx, ip)
+	return err == nil && line == keysyncFirstLine([]byte(pubLine))
 }
 
 // daemonTuneRuntimeFootprint keeps the resident footprint tiny — one OS thread, a hard

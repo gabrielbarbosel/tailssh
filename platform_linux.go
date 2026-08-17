@@ -566,6 +566,11 @@ func (p *linuxPlatform) SupportsIPNBus() bool { return !p.termux }
 // command via sudo where needed, so the process itself is never re-launched.
 func (p *linuxPlatform) EnsurePrivilege([]string) (bool, error) { return false, nil }
 
+// EnsureDaemonPersistence: nothing to repair — the systemd unit (Restart=always,
+// StartLimitIntervalSec=0) and the Termux supervisor loop already revive the daemon
+// after any exit.
+func (p *linuxPlatform) EnsureDaemonPersistence() error { return nil }
+
 // InstallDaemon installs the tailssh daemon as a persistent service: a systemd
 // unit on Linux, or a Termux:Boot script under Termux.
 func (p *linuxPlatform) InstallDaemon(exePath string) error {
@@ -695,6 +700,7 @@ func systemdDaemonUnit(exePath string) string {
 Description=tailssh daemon
 After=tailscaled.service network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

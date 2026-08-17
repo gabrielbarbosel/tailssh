@@ -148,14 +148,57 @@ func checkForUpdate(pl Platform) (replaced bool, err error) {
 	if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
 		return false, fmt.Errorf("downloaded %s failed checksum — refusing to install", asset)
 	}
+	if err := probeExecutable(data); err != nil {
+		return false, fmt.Errorf("staged %s does not run on this host — keeping the current binary: %w", asset, err)
+	}
 	return true, pl.ReplaceSelf(data)
 }
 
-// cleanupUpdateLeftovers removes the old executable a Windows self-replace renames
-// aside (<exe>.old). A no-op elsewhere / when absent.
+// probeExecutable verifies the downloaded binary actually STARTS on this host before
+// it replaces the running one. A checksum proves integrity, not runnability: an
+// application-control policy (e.g. Windows Smart App Control) can block an unknown
+// unsigned binary outright, and swapping to one bricks the node — the daemon's next
+// restart runs nothing, and so does every command that could have fixed it. The bytes
+// are staged next to the current exe (same volume and policy scope; a temp dir can be
+// noexec on Unix) and started with a throwaway argument the CLI answers with its usage
+// text; only the process failing to START counts as blocked.
+func probeExecutable(data []byte) error {
+	exe, err := selfExe()
+	if err != nil {
+		return err
+	}
+	probe := filepath.Join(filepath.Dir(exe), "tailssh-probe"+filepath.Ext(exe))
+	if err := os.WriteFile(probe, data, 0o755); err != nil {
+		return err
+	}
+	defer os.Remove(probe)
+	cmd := command(probe, "probe")
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start staged binary: %w", err)
+	}
+	_ = cmd.Wait()
+	return nil
+}
+
+// cleanupUpdateLeftovers removes update debris: the executables a Windows
+// self-replace renames aside (<exe>.old, plus the uniquely-named asides ReplaceSelf
+// falls back to when a stale .old is still a live process's mapped image) and any
+// probe binary an interrupted update left staged. Best-effort: an aside still mapped
+// by an exiting process simply survives until the next daemon start prunes it.
 func cleanupUpdateLeftovers() {
-	if exe, err := selfExe(); err == nil {
-		_ = os.Remove(exe + ".old")
+	exe, err := selfExe()
+	if err != nil {
+		return
+	}
+	patterns := []string{exe + ".old*", filepath.Join(filepath.Dir(exe), "tailssh-probe*")}
+	for _, pat := range patterns {
+		matches, err := filepath.Glob(pat)
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
 	}
 }
 
@@ -175,7 +218,10 @@ func runUpdate(pl Platform) error {
 		fmt.Println("tailssh is up to date.")
 		return nil
 	}
-	fmt.Println("tailssh updated — restarting into the new binary.")
+	fmt.Println("tailssh updated — restarting the daemon into the new binary.")
+	if err := pl.RestartDaemon(); err != nil {
+		fmt.Printf("daemon restart: %v — it keeps running the previous binary until its next restart\n", err)
+	}
 	return restartSelf()
 }
 

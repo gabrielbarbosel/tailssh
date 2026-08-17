@@ -605,6 +605,31 @@ func startDaemonNow(exePath string) {
 		strings.ReplaceAll(exePath, "'", "''")))
 }
 
+// RestartDaemon bounces the daemon so it runs the binary now on disk. Task mode
+// stops and starts the scheduled task (the stop kills the running instance, however
+// stale its image); run-key mode kills any running daemon by command line — never
+// this `update` process itself, whose command line carries no "daemon" — and
+// relaunches detached.
+func (p windowsPlatform) RestartDaemon() error {
+	if _, err := windowsPowershell(
+		"Get-ScheduledTask -TaskName '" + windowsSvcName + "' -ErrorAction Stop | Out-Null"); err == nil {
+		_, err = windowsPowershell(
+			"Stop-ScheduledTask -TaskName '" + windowsSvcName + "';" +
+				"Start-ScheduledTask -TaskName '" + windowsSvcName + "'")
+		return err
+	}
+	exe, err := selfExe()
+	if err != nil {
+		return err
+	}
+	_, _ = windowsPowershell(
+		"Get-CimInstance Win32_Process -Filter \"Name='tailssh.exe'\" | " +
+			"Where-Object { $_.CommandLine -like '* daemon*' } | " +
+			"ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+	startDaemonNow(exe)
+	return nil
+}
+
 // RemoveDaemon removes both persistence mechanisms (scheduled task and Run key) and
 // stops any running instance. Every step is best-effort — whichever exists is gone.
 func (windowsPlatform) RemoveDaemon() error {

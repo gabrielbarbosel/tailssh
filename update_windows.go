@@ -15,13 +15,20 @@ import (
 
 // ReplaceSelf swaps the running executable: rename it to <exe>.old (permitted while
 // running) and write the new bytes to the original path, rolling back on failure.
+// A stale .old that cannot be removed is not fatal: it is the mapped image of a
+// still-running previous daemon (a mapped image can be neither deleted nor replaced),
+// and failing here would wedge updates until that process dies. The rename falls back
+// to a uniquely-named aside instead; cleanupUpdateLeftovers prunes every aside once
+// nothing maps it.
 func (windowsPlatform) ReplaceSelf(data []byte) error {
 	exe, err := selfExe()
 	if err != nil {
 		return err
 	}
 	old := exe + ".old"
-	_ = os.Remove(old)
+	if err := os.Remove(old); err != nil && !os.IsNotExist(err) {
+		old = fmt.Sprintf("%s.old.%d", exe, os.Getpid())
+	}
 	if err := os.Rename(exe, old); err != nil {
 		return fmt.Errorf("rename running exe: %w", err)
 	}

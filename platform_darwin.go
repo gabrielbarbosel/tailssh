@@ -282,6 +282,15 @@ func darwinUnloadLaunchAgent(target, plistPath string) {
 // the daemon after any exit.
 func (p darwinPlatform) EnsureDaemonPersistence() error { return nil }
 
+// RestartDaemon bounces the daemon so it runs the binary now on disk (kickstart -k
+// kills the running instance and relaunches it under KeepAlive).
+func (p darwinPlatform) RestartDaemon() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "launchctl", "kickstart", "-k",
+		darwinDaemonDomainTarget()+"/"+darwinDaemonLabel).Run()
+}
+
 // InstallDaemon writes a per-user LaunchAgent plist and loads it. Running as the
 // logged-in user keeps authorized_keys owned correctly and avoids root/TCC.
 func (p darwinPlatform) InstallDaemon(exePath string) error {

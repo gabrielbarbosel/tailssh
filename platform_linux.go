@@ -571,6 +571,20 @@ func (p *linuxPlatform) EnsurePrivilege([]string) (bool, error) { return false, 
 // after any exit.
 func (p *linuxPlatform) EnsureDaemonPersistence() error { return nil }
 
+// RestartDaemon bounces the daemon so it runs the binary now on disk: systemd
+// restarts the unit; under Termux killing the daemon is enough — the supervisor
+// loop respawns it within seconds (the " daemon" pattern can never match this
+// `update` process).
+func (p *linuxPlatform) RestartDaemon() error {
+	if p.termux {
+		if exe, err := os.Executable(); err == nil {
+			_ = command("pkill", "-f", exe+" daemon").Run()
+		}
+		return nil
+	}
+	return p.run("systemctl", "restart", linuxDaemonUnit)
+}
+
 // InstallDaemon installs the tailssh daemon as a persistent service: a systemd
 // unit on Linux, or a Termux:Boot script under Termux.
 func (p *linuxPlatform) InstallDaemon(exePath string) error {

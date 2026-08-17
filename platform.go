@@ -64,6 +64,11 @@ type Platform interface {
 	InstallDaemon(exePath string) error
 	// RemoveDaemon uninstalls the daemon service.
 	RemoveDaemon() error
+	// RestartDaemon bounces the installed daemon service so it runs the binary
+	// currently on disk. `update` calls it after a swap: without the bounce the old
+	// daemon keeps running from its renamed-aside image — stale code serving the
+	// mesh, and a mapped .old that wedges the next update.
+	RestartDaemon() error
 	// EnsureDaemonPersistence repairs this node's daemon registration so an exited
 	// daemon is always revived — called by the daemon at startup, so the whole fleet
 	// converges through auto-update with no manual reinstall. A no-op where the

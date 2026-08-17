@@ -121,10 +121,9 @@ func runSync(pl Platform) error {
 
 	// The file mesh rides the same trusted, addressable peer set as the key mesh:
 	// mount every online peer's filesystem, unmount those gone/offline. Inherits the
-	// daemon's event loop; a node that can't mount (Termux) is a no-op.
-	if err := reconcileMounts(pl, owned, keyed); err != nil {
-		note(err)
-	}
+	// daemon's event loop; a node that can't mount (Termux) is a no-op. Best-effort by
+	// contract — mount problems are reported inside but never fail the key sync.
+	reconcileMounts(pl, owned, keyed)
 
 	if err := savePeers(keyed); err != nil {
 		note(err)

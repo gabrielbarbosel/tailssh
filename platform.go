@@ -75,6 +75,12 @@ type Platform interface {
 	// Idempotent and best-effort.
 	EnsureMountTooling() error
 
+	// MountToolingPresent reports whether that mount client is installed right now.
+	// reconcileMounts silently skips mounting while it is false — a node provisioned
+	// before the file mesh existed (or whose `up` install failed) must keep exchanging
+	// keys, not fail every sync over a client only `up` installs.
+	MountToolingPresent() bool
+
 	// MountPeer mounts spec's whole filesystem read-write as a local network unit and
 	// returns the mountpoint used — a drive letter like "Z:" on Windows, a directory
 	// on Unix. prevAt is the mountpoint from the previous pass ("" if none), reused

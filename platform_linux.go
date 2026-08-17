@@ -750,6 +750,11 @@ func (p *linuxPlatform) MountSupport() (canExport, canMount bool) {
 	return true, !p.termux
 }
 
+// MountToolingPresent: mounting a peer needs sshfs.
+func (p *linuxPlatform) MountToolingPresent() bool {
+	return haveExecutable("sshfs")
+}
+
 // EnsureMountTooling installs sshfs when missing (never under Termux). Idempotent.
 func (p *linuxPlatform) EnsureMountTooling() error {
 	if p.termux || haveExecutable("sshfs") {

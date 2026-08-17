@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 )
@@ -145,6 +147,68 @@ func TestValidateSelfOwner(t *testing.T) {
 	t.Run("missing self node is refused", func(t *testing.T) {
 		if err := validateSelfOwner(status{User: map[string]userProfile{"7": {LoginName: "me@example.com"}}}); err == nil {
 			t.Error("validateSelfOwner accepted a status with no self node")
+		}
+	})
+}
+
+// closerFunc adapts a func into an io.Closer for supervisor tests.
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
+func TestKeyserverSupervisorEnsure(t *testing.T) {
+	ip := "100.64.0.1"
+	resolveErr := error(nil)
+	openErr := error(nil)
+	opens, closes := 0, 0
+	s := &keyserverSupervisor{
+		resolve: func() (string, error) { return ip, resolveErr },
+		open: func(string) (io.Closer, error) {
+			if openErr != nil {
+				return nil, openErr
+			}
+			opens++
+			return closerFunc(func() error { closes++; return nil }), nil
+		},
+	}
+
+	t.Run("first ensure binds once", func(t *testing.T) {
+		s.ensure()
+		if opens != 1 || s.bound != ip {
+			t.Fatalf("opens=%d bound=%q, want one bind on %q", opens, s.bound, ip)
+		}
+	})
+	t.Run("same IP is a no-op", func(t *testing.T) {
+		s.ensure()
+		if opens != 1 || closes != 0 {
+			t.Errorf("opens=%d closes=%d after unchanged IP, want 1/0", opens, closes)
+		}
+	})
+	t.Run("changed IP closes the old listener and rebinds", func(t *testing.T) {
+		ip = "100.64.0.2"
+		s.ensure()
+		if opens != 2 || closes != 1 || s.bound != ip {
+			t.Errorf("opens=%d closes=%d bound=%q, want rebind on %q", opens, closes, s.bound, ip)
+		}
+	})
+	t.Run("resolve failure keeps the current listener", func(t *testing.T) {
+		resolveErr = fmt.Errorf("tailscale down")
+		s.ensure()
+		if opens != 2 || closes != 1 {
+			t.Errorf("opens=%d closes=%d after resolve failure, want listener untouched", opens, closes)
+		}
+		resolveErr = nil
+	})
+	t.Run("failed rebind is retried by the next ensure", func(t *testing.T) {
+		ip, openErr = "100.64.0.3", fmt.Errorf("bind refused")
+		s.ensure()
+		if closes != 2 || s.ks != nil {
+			t.Fatalf("closes=%d ks=%v: old listener must be gone even when the rebind fails", closes, s.ks)
+		}
+		openErr = nil
+		s.ensure()
+		if opens != 3 || s.bound != ip {
+			t.Errorf("opens=%d bound=%q, want recovery bind on %q", opens, s.bound, ip)
 		}
 	})
 }

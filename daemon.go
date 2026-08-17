@@ -83,23 +83,17 @@ func runDaemon(pl Platform) error {
 		return fmt.Errorf("identity: %w", err)
 	}
 
-	selfIP, err := daemonResolveSelfIP()
-	if err != nil {
-		return err
-	}
-
 	engine := &syncEngine{pl: pl}
 
-	ks, ksDebounce, err := daemonStartKeyserver(pl, selfIP, pubLine, engine)
-	if err != nil {
-		return fmt.Errorf("keyserver: %w", err)
-	}
+	ks, ksDebounce := daemonNewKeyserverSupervisor(pl, pubLine, engine)
+	engine.beforeSync = ks.ensure
+	ks.ensure()
 	defer ks.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("daemon: %s up on %s (ipn-bus=%v)", pl.Name(), selfIP, pl.SupportsIPNBus())
+	log.Printf("daemon: %s up (ipn-bus=%v)", pl.Name(), pl.SupportsIPNBus())
 
 	cleanupUpdateLeftovers()
 	engine.trigger(false)
@@ -144,8 +138,8 @@ func daemonResolveSelfIP() (string, error) {
 	return "", fmt.Errorf("cannot determine this device's tailnet IP (is Tailscale connected?)")
 }
 
-// daemonStartKeyserver brings up the key/meta/roster endpoints and returns the debounce
-// that a /resync POST arms — the only change signal on Android, and a
+// daemonNewKeyserverSupervisor prepares the key/meta/roster endpoints and returns the
+// debounce that a /resync POST arms — the only change signal on Android, and a
 // belt-and-suspenders one on desktops. A CLI peer's roster push replaces our cached map,
 // which we adopt and re-sync so this node rebuilds ssh_config/authorized_keys against
 // the new peers.
@@ -156,7 +150,7 @@ func daemonResolveSelfIP() (string, error) {
 // they would not fetch its key until their next slow reconcile. Announcing the moment we
 // learn our peers closes that gap: every device, including one that was offline and just
 // came back, is picked up within the roster-push interval instead of up to a reconcile.
-func daemonStartKeyserver(pl Platform, selfIP, pubLine string, engine *syncEngine) (io.Closer, *debounce, error) {
+func daemonNewKeyserverSupervisor(pl Platform, pubLine string, engine *syncEngine) (*keyserverSupervisor, *debounce) {
 	resyncDebounce := newDebounce(2*time.Second, 10*time.Second, func() { engine.trigger(false) })
 	metaBytes, _ := json.Marshal(nodeMeta{User: localUsername(), OS: pl.Name(), Port: pl.SSHListenPort()})
 	adoptRoster := func(raw []byte) {
@@ -165,11 +159,69 @@ func daemonStartKeyserver(pl Platform, selfIP, pubLine string, engine *syncEngin
 			go daemonAnnouncePresence()
 		}
 	}
-	ks, err := startKeyserver(selfIP, pubLine, string(metaBytes), readHostKey(pl.SSHListenPort()), rosterJSON, resyncDebounce.arm, adoptRoster)
-	if err != nil {
-		return nil, nil, err
+	hostKey := readHostKey(pl.SSHListenPort())
+	open := func(ip string) (io.Closer, error) {
+		return startKeyserver(ip, pubLine, string(metaBytes), hostKey, rosterJSON, resyncDebounce.arm, adoptRoster)
 	}
-	return ks, resyncDebounce, nil
+	return &keyserverSupervisor{resolve: daemonResolveSelfIP, open: open}, resyncDebounce
+}
+
+// keyserverSupervisor keeps the keyserver listening on this device's CURRENT tailnet
+// IP. startKeyserver deliberately binds one explicit IP (tailnet membership is the
+// authorization boundary, so never 0.0.0.0), but that IP is only resolved once per
+// bind — and it can change while the daemon runs (re-login, node re-added to the
+// tailnet). A listener left on the old IP is silently unreachable: peers stop fetching
+// this node's key and `ssh <name>` eventually fails with publickey errors while
+// everything still looks up. ensure() heals both that drift and a bind that failed
+// outright (Tailscale not connected yet at boot): it re-resolves the IP and rebinds
+// only when the listener is missing or on the wrong address, so the steady-state call
+// is a cheap compare.
+type keyserverSupervisor struct {
+	mu      sync.Mutex
+	resolve func() (string, error)             // current tailnet IP (daemonResolveSelfIP)
+	open    func(ip string) (io.Closer, error) // binds the keyserver to one IP
+	bound   string
+	ks      io.Closer
+}
+
+// ensure (re)binds the keyserver to the current tailnet IP if it isn't already there.
+// Called at daemon startup and before every sync pass — netmap events, /resync nudges
+// and the reconcile ticker all funnel through the sync engine, so an IP change is
+// picked up by the very event that announces it. Failures are logged, never fatal:
+// the next pass retries.
+func (s *keyserverSupervisor) ensure() {
+	ip, err := s.resolve()
+	if err != nil {
+		return // no tailnet view right now; keep whatever listener we have
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ks != nil && ip == s.bound {
+		return
+	}
+	if s.ks != nil {
+		log.Printf("daemon: keyserver: tailnet IP moved %s -> %s, rebinding", s.bound, ip)
+		s.ks.Close()
+		s.ks = nil
+	}
+	ks, err := s.open(ip)
+	if err != nil {
+		log.Printf("daemon: keyserver: %v (will retry on next sync)", err)
+		return
+	}
+	s.ks, s.bound = ks, ip
+	log.Printf("daemon: keyserver up on %s", ip)
+}
+
+func (s *keyserverSupervisor) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ks == nil {
+		return nil
+	}
+	err := s.ks.Close()
+	s.ks = nil
+	return err
 }
 
 // daemonAnnouncePresence nudges peers already on the tailnet to re-sync and authorize us
@@ -254,13 +306,16 @@ func daemonStopSyncing(resyncDebounce *debounce, engine *syncEngine) {
 // syncEngine serializes runSync calls. At most one runs at a time; a trigger that
 // arrives mid-run sets a dirty flag so exactly one follow-up run happens afterwards.
 type syncEngine struct {
-	pl      Platform
-	mu      sync.Mutex
-	running bool
-	dirty   bool
-	relay   bool           // push the roster to Android peers after the next run
-	closed  bool           // once true, trigger is a no-op (shutdown in progress)
-	wg      sync.WaitGroup // tracks the in-flight loop goroutine
+	pl Platform
+	// beforeSync runs ahead of every sync pass (the keyserver supervisor's ensure):
+	// each pass then both serves on and syncs against the same, current tailnet IP.
+	beforeSync func()
+	mu         sync.Mutex
+	running    bool
+	dirty      bool
+	relay      bool           // push the roster to Android peers after the next run
+	closed     bool           // once true, trigger is a no-op (shutdown in progress)
+	wg         sync.WaitGroup // tracks the in-flight loop goroutine
 }
 
 // trigger requests a sync, coalescing into a single rerun if one is already running.
@@ -326,6 +381,9 @@ func (e *syncEngine) runOnce(relay bool) {
 			log.Printf("daemon: sync panic recovered: %v", r)
 		}
 	}()
+	if e.beforeSync != nil {
+		e.beforeSync()
+	}
 	if err := runSync(e.pl); err != nil {
 		log.Printf("daemon: sync error: %v", err)
 	}

@@ -71,9 +71,17 @@ func saveMounts(m map[string]string) {
 // every online same-owner peer whose remote login we know, and unmount anything that
 // went offline or left. Prune-safe: it only ever acts on a set derived from a
 // successful discover (its caller returns before this on a failed/degraded read).
-func reconcileMounts(pl Platform, owned []device, keyed map[string]cachedPeer) error {
+//
+// Best-effort by contract: problems are reported on stderr but never returned. The
+// file mesh is a convenience riding on the key mesh, so a failed mount — tooling
+// missing, one peer's sshd refusing SFTP — must never make the sync that keeps SSH
+// itself working look (or exit) failed.
+func reconcileMounts(pl Platform, owned []device, keyed map[string]cachedPeer) {
 	if _, canMount := pl.MountSupport(); !canMount {
-		return nil // e.g. Termux: no root FUSE — serve-only node
+		return // e.g. Termux: no root FUSE — serve-only node
+	}
+	if !pl.MountToolingPresent() {
+		return // mount client not installed (see `up`); keys keep flowing regardless
 	}
 	kh, _ := knownHostsPath()
 	id := appKeyPath()
@@ -97,13 +105,9 @@ func reconcileMounts(pl Platform, owned []device, keyed map[string]cachedPeer) e
 		}
 	}
 
-	var firstErr error
 	note := func(e error) {
 		if e != nil {
 			fmt.Fprintln(os.Stderr, "mounts:", e)
-			if firstErr == nil {
-				firstErr = e
-			}
 		}
 	}
 
@@ -130,7 +134,6 @@ func reconcileMounts(pl Platform, owned []device, keyed map[string]cachedPeer) e
 	}
 
 	saveMounts(next)
-	return firstErr
 }
 
 // unmountAll tears down every recorded mount and clears the record — used by

@@ -48,6 +48,7 @@ func statusPrintLocalNode(pl Platform, self device, haveSelf bool) {
 	installed, running := pl.SSHState()
 	fmt.Printf("  ssh server  : %s\n", sshStateLabel(installed, running))
 	fmt.Printf("  keyserver   : %s\n", upDown(haveSelf && keyserverUp(self.ip)))
+	fmt.Printf("  mounts      : %s\n", mountsLabel(pl))
 	if mtu, ok := tailnetMTU(); ok {
 		fmt.Printf("  tailnet mtu : %s\n", mtuLabel(mtu))
 	}
@@ -136,6 +137,29 @@ func statusPeerReach(p device, keyed bool) string {
 		return "tailscale-ssh"
 	}
 	return statusReachUnreachable
+}
+
+// mountsLabel describes the file mesh from this node's side: serve-only where
+// mounting is impossible (Termux), a pointer at `up` when the mount client is
+// missing (reconcileMounts skips silently, so this line is where that state shows),
+// else which peers are mounted where.
+func mountsLabel(pl Platform) string {
+	if _, canMount := pl.MountSupport(); !canMount {
+		return "serve-only (this node shares its files; it cannot mount peers)"
+	}
+	if !pl.MountToolingPresent() {
+		return "tooling missing (run `tailssh up` to install the mount client)"
+	}
+	mounted := loadMounts()
+	if len(mounted) == 0 {
+		return "ready (no peers mounted)"
+	}
+	var parts []string
+	for name, at := range mounted {
+		parts = append(parts, fmt.Sprintf("%s at %s", name, at))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ", ")
 }
 
 // servingLabel renders the key-serving column: "serving" when the peer answers its

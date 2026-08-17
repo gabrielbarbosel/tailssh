@@ -312,6 +312,11 @@ func (p darwinPlatform) RemoveDaemon() error {
 // MountSupport: macOS can serve (Remote Login) and mount (macFUSE + sshfs).
 func (darwinPlatform) MountSupport() (canExport, canMount bool) { return true, true }
 
+// MountToolingPresent: mounting a peer needs sshfs (which itself needs macFUSE).
+func (darwinPlatform) MountToolingPresent() bool {
+	return haveExecutable("sshfs")
+}
+
 // EnsureMountTooling best-effort installs macFUSE + sshfs via Homebrew. macFUSE needs
 // a user-approved kernel extension, which cannot be automated — so on a fresh box
 // this returns a clear error naming the manual approval step rather than pretending.

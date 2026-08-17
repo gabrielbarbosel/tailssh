@@ -30,6 +30,12 @@ const (
 // MountSupport: Windows can both serve (its sshd) and mount (rclone+WinFsp).
 func (windowsPlatform) MountSupport() (canExport, canMount bool) { return true, true }
 
+// MountToolingPresent: mounting needs both rclone (the SFTP client) and WinFsp
+// (the FUSE layer rclone mounts through).
+func (windowsPlatform) MountToolingPresent() bool {
+	return haveExecutable("rclone") && winfspPresent()
+}
+
 // EnsureMountTooling installs WinFsp + rclone via winget when missing (idempotent).
 func (windowsPlatform) EnsureMountTooling() error {
 	if _, err := exec.LookPath("winget"); err != nil {

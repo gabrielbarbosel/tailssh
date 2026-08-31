@@ -518,13 +518,21 @@ func (p windowsPlatform) InstallDaemon(exePath string) error {
 //
 // StartWhenAvailable makes a tick missed while asleep fire on wake instead of
 // waiting out the next interval.
+//
+// $tick carries no -RepetitionDuration on purpose: an omitted duration serializes
+// to an empty <Duration>, which the Task Scheduler reads as "repeat forever". The
+// obvious spellings for that are both rejected at registration — [TimeSpan]::MaxValue
+// emits P99999999DT23H59M59S and [TimeSpan]::Zero emits PT0S, and each fails the
+// whole Register-ScheduledTask with 0x80041318 ("value is improperly formatted or
+// out of range"). That took the watchdog down with it, leaving the legacy
+// logon-only task in place — the exact outage this trigger exists to prevent.
 func windowsDaemonRegisterScript(exePath string) string {
 	psq := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
 	return "$ErrorActionPreference='Stop';" +
 		"$a=New-ScheduledTaskAction -Execute '" + psq(exePath) + "' -Argument 'daemon';" +
 		"$logon=New-ScheduledTaskTrigger -AtLogOn;" +
 		"$tick=New-ScheduledTaskTrigger -Once -At (Get-Date)" +
-		" -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue);" +
+		" -RepetitionInterval (New-TimeSpan -Minutes 5);" +
 		"$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries" +
 		" -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable" +
 		" -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1);" +

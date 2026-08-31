@@ -41,8 +41,10 @@ func releaseAsset() string {
 	return name
 }
 
-// autoUpdateDisabledPath is a sentinel whose mere presence opts a node out of
-// auto-update — a file, not an env toggle (the project keeps config out of env).
+// autoUpdateDisabledPath is a sentinel whose mere presence opts a node out of the
+// daemon's unattended update loop — a file, not an env toggle (the project keeps
+// config out of env). It never gates `tailssh update`: an operator asking for an
+// update by name has already overridden the opt-out by asking.
 func autoUpdateDisabledPath() string {
 	return filepath.Join(filepath.Dir(appKeyPath()), "autoupdate.off")
 }
@@ -118,10 +120,12 @@ func downloadRelease(url string) ([]byte, error) {
 // verifying the download against SHA256SUMS before swapping. replaced=true means the
 // on-disk binary was updated and the caller should restart into it. Offline-first:
 // network errors are returned, never fatal.
+//
+// The autoupdate.off sentinel is NOT consulted here — it gates the daemon's unattended
+// loop, not this function. Honouring it here made `tailssh update`, an explicit
+// operator request, a silent no-op that still printed "tailssh is up to date." on a
+// node that was demonstrably behind, hiding a stale binary behind a reassuring line.
 func checkForUpdate(pl Platform) (replaced bool, err error) {
-	if !autoUpdateEnabled() {
-		return false, nil
-	}
 	asset := releaseAsset()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -237,6 +241,10 @@ func daemonAutoUpdateLoop(ctx context.Context, pl Platform) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+		}
+		if !autoUpdateEnabled() {
+			timer.Reset(updateCheckInterval + backoff(0, 5*time.Minute, 5*time.Minute))
+			continue
 		}
 		if replaced, err := checkForUpdate(pl); err != nil {
 			log.Printf("daemon: update: %v", err)

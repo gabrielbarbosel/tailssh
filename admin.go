@@ -37,6 +37,7 @@ func runUninstall(pl Platform) error {
 	unmountAll(pl)
 	fmt.Println("  mounts         : detached")
 	adminRevokeInboundAccess(pl)
+	adminClearTruecolor(pl)
 	adminClearSSHConfig()
 	adminRemoveIdentityCache()
 	adminRemoveBinary()
@@ -58,6 +59,19 @@ func adminRevokeInboundAccess(pl Platform) {
 		return
 	}
 	fmt.Printf("  authorized_keys: managed block cleared\n")
+}
+
+// adminClearTruecolor removes the managed AcceptEnv block from sshd_config,
+// restoring the pre-tailssh server config.
+func adminClearTruecolor(pl Platform) {
+	changed, err := clearSSHDAcceptEnv(pl)
+	if err != nil {
+		fmt.Printf("  sshd_config    : NOT cleared — %v\n", err)
+		return
+	}
+	if changed {
+		fmt.Println("  sshd_config    : managed block cleared")
+	}
 }
 
 // adminClearSSHConfig drops the managed outbound host entries from ~/.ssh/config.

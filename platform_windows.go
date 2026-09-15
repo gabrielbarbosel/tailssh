@@ -194,14 +194,40 @@ func (windowsPlatform) EnableSSH() error {
 
 func (windowsPlatform) SSHListenPort() int { return 22 }
 
+// windowsProgramData resolves %ProgramData% with the stock fallback.
+func windowsProgramData() string {
+	if pd := os.Getenv("ProgramData"); pd != "" {
+		return pd
+	}
+	return `C:\ProgramData`
+}
+
 // windowsAdminKeysPath is the system-wide authorized_keys file sshd consults
 // for members of the Administrators group.
 func windowsAdminKeysPath() string {
-	pd := os.Getenv("ProgramData")
-	if pd == "" {
-		pd = `C:\ProgramData`
+	return filepath.Join(windowsProgramData(), "ssh", "administrators_authorized_keys")
+}
+
+// windowsSSHDConfigPath is where Windows OpenSSH keeps sshd_config.
+func windowsSSHDConfigPath() string {
+	return filepath.Join(windowsProgramData(), "ssh", "sshd_config")
+}
+
+func (windowsPlatform) SSHDConfigPath() string { return windowsSSHDConfigPath() }
+
+// ReplaceSSHDConfig rewrites sshd_config — a ProgramData write, so it needs the
+// elevated token like every provisioning write there — and restarts the sshd
+// service, since Windows OpenSSH has no reload signal. Callers only send
+// changed content, so the restart happens at most once per rollout.
+func (p windowsPlatform) ReplaceSSHDConfig(data []byte) error {
+	if !p.elevated {
+		return fmt.Errorf("sshd_config needs an elevated run — re-run `tailssh up` as admin")
 	}
-	return filepath.Join(pd, "ssh", "administrators_authorized_keys")
+	if err := atomicWrite(windowsSSHDConfigPath(), data, 0o644); err != nil {
+		return err
+	}
+	_, err := windowsPowershell("$ErrorActionPreference='Stop'; Restart-Service sshd")
+	return err
 }
 
 // windowsAdminKeysActive reports whether sshd_config actually routes
@@ -212,11 +238,7 @@ func windowsAdminKeysPath() string {
 // silently ignored. sshd_config is the source of truth, so the managed
 // block must follow it. Unreadable config falls back to the stock default.
 func windowsAdminKeysActive() bool {
-	pd := os.Getenv("ProgramData")
-	if pd == "" {
-		pd = `C:\ProgramData`
-	}
-	data, err := os.ReadFile(filepath.Join(pd, "ssh", "sshd_config"))
+	data, err := os.ReadFile(windowsSSHDConfigPath())
 	if err != nil {
 		return true
 	}

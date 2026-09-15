@@ -87,9 +87,6 @@ func ensureTailscale(pl Platform) bool {
 		printTailscaleOwnedElsewhere(owner)
 		return false
 	}
-	if ensureTailscaleAuthKeyJoin() {
-		return true
-	}
 	return ensureTailscaleInteractiveLogin()
 }
 
@@ -165,30 +162,6 @@ func ensureTailscaleTermux(pl Platform) bool {
 	}
 	fmt.Println("  tailscale   : ready (app connected)")
 	return true
-}
-
-// ensureTailscaleAuthKeyJoin attempts a non-interactive `tailscale up --authkey`
-// join when TS_AUTHKEY is supplied, removing the manual browser login on
-// unattended/first-run setups. The key is read at use and never written to disk.
-// Reports whether the node came up; callers fall back to interactive login.
-func ensureTailscaleAuthKeyJoin() bool {
-	key := os.Getenv("TS_AUTHKEY")
-	if key == "" {
-		return false
-	}
-	bin, err := tailscaleBin()
-	if err != nil {
-		return false
-	}
-	fmt.Println("Tailscale not logged in — joining with TS_AUTHKEY...")
-	if exec.Command(bin, "up", "--authkey", key).Run() != nil {
-		_ = exec.Command("sudo", bin, "up", "--authkey", key).Run()
-	}
-	if tailscaleReady() {
-		fmt.Println("  tailscale   : ready")
-		return true
-	}
-	return false
 }
 
 // ensureTailscaleInteractiveLogin starts `tailscale up`, which prints/opens the
@@ -377,10 +350,10 @@ func upProvision(pl Platform, r upReadiness) error {
 	if !ensureSSH(pl) {
 		return nil
 	}
+	upEnsureTruecolor(pl)
 	enableTailscaleSSH(pl)
 	upEnsureTailnetMTU(pl)
 	upEnsureMountTooling(pl)
-	upEnsureSSHAcceptRule()
 	upEnsureIdentity(pl)
 	upJoinMesh(pl)
 	upInstallDaemon(pl)
@@ -454,18 +427,21 @@ func upEnsureMountTooling(pl Platform) {
 	fmt.Println("  mounts      : ok (peer filesystems will mount as network units)")
 }
 
-// upEnsureSSHAcceptRule ensures the tailnet's `ssh accept` policy rule when a
-// Tailscale API token is present (TS_API_KEY), making Tailscale SSH seamless with
-// no browser check. One-time and tailnet-wide; silently skipped without a token.
-func upEnsureSSHAcceptRule() {
-	if os.Getenv("TS_API_KEY") == "" {
+// upEnsureTruecolor makes the local sshd accept COLORTERM now, during
+// provisioning, so the very first inbound session renders 24-bit color; the
+// outbound half rides the sync-generated ssh_config stanzas (sshenv.go).
+// Best-effort: a failure never aborts the run.
+func upEnsureTruecolor(pl Platform) {
+	changed, err := ensureSSHDAcceptEnv(pl)
+	if err != nil {
+		fmt.Printf("  truecolor   : %v — continuing\n", err)
 		return
 	}
-	if err := applyACL(true, true); err != nil {
-		fmt.Printf("  acl         : %v\n", err)
+	if changed {
+		fmt.Println("  truecolor   : ok (sshd now accepts COLORTERM)")
 		return
 	}
-	fmt.Println("  acl         : ssh accept ensured")
+	fmt.Println("  truecolor   : ok")
 }
 
 // upEnsureIdentity generates the tailssh ed25519 identity now that ssh-keygen is

@@ -295,16 +295,6 @@ func main() {
 		if err := runDaemon(selectPlatform()); err != nil {
 			fail(err)
 		}
-	case "acl":
-		apply := false
-		for _, a := range os.Args[2:] {
-			if a == "--apply" {
-				apply = true
-			}
-		}
-		if err := runACL(apply); err != nil {
-			fail(err)
-		}
 	case "off":
 		if err := runOff(selectPlatform()); err != nil {
 			fail(err)
@@ -314,7 +304,7 @@ func main() {
 			fail(err)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "usage: tailssh (list | status | up [--yes] | sync | update | daemon | acl [--apply] | off | uninstall)")
+		fmt.Fprintln(os.Stderr, "usage: tailssh (list | status | up [--yes] | sync | update | daemon | off | uninstall)")
 		os.Exit(1)
 	}
 }

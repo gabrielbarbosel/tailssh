@@ -603,7 +603,10 @@ func peerUsesTailscaleSSH(peerOS string, inMesh bool) bool {
 // peer can't be reached at all: an empty DNSName (which would emit a malformed
 // "Host " line), or a peer outside the mesh with no Tailscale SSH fallback
 // (Windows/Android). Tailscale SSH authenticates by tailnet identity, so those
-// entries carry no key, port or IdentityFile.
+// entries carry no key, port or IdentityFile. Every stanza asserts
+// COLORTERM=truecolor: mesh peers accept it via the managed sshd block
+// (sshenv.go); a server that wasn't told to accept it drops it silently, so
+// the assertion is never an error on the fallback path.
 func sshConfigHostEntry(p device, keyed map[string]cachedPeer, paths sshConfigPaths) (string, bool) {
 	if p.name == "" {
 		return "", false
@@ -620,6 +623,7 @@ func sshConfigHostEntry(p device, keyed map[string]cachedPeer, paths sshConfigPa
 	if inMesh && c.User != "" {
 		fmt.Fprintf(&b, "    User %s\n", sshConfigUser(c.User))
 	}
+	fmt.Fprintf(&b, "    SetEnv %s=%s\n", truecolorEnvVar, truecolorEnvValue)
 	if useTailscaleSSH {
 		return b.String(), true
 	}

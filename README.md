@@ -39,16 +39,13 @@ ssh my-server
 | `tailssh up [--yes]` | audit; with `--yes`, an ordered bootstrap: ensure Tailscale → OpenSSH → identity → sync → daemon, auto-installing or opening the installer/login and waiting so it flows straight through |
 | `tailssh sync` | fetch trusted peers' keys → managed `authorized_keys` + `~/.ssh/config` + `known_hosts` |
 | `tailssh daemon` | event-driven: watch the tailnet and re-sync on every change; also keeps the tailnet interface MTU clamped for broken-PMTU direct paths (e.g. to a phone) |
-| `tailssh acl [--apply]` | ensure the tailnet's `ssh accept` rule (preserving the rest of the policy); needs `TS_API_KEY` |
 | `tailssh off` | turn the service off (stop the daemon); keys stay, `up` re-arms it |
 | `tailssh uninstall` | remove tailssh from this machine (daemon, managed blocks, identity, binary) |
 
-## Configuration (all optional, read from the environment; secrets are never stored)
+## Configuration (all optional, read from the environment)
 
 | env var | effect |
 |---|---|
-| `TS_AUTHKEY` | join Tailscale non-interactively during `up` (`tailscale up --authkey …`) — skips the manual browser login. Used once, never written to disk. |
-| `TS_API_KEY` | lets `up`/`acl` ensure the tailnet `ssh accept` rule automatically. Used transiently, never stored. |
 | `TAILSSH_BATTERY=saver` | on Termux, drop the always-on wake lock: reachable only while the device is awake, in exchange for zero idle battery draw. |
 | `TAILSSH_SEED` | comma-separated peer tailnet IPs for a CLI-less node's very first discovery, before any peer has pushed it a roster (rarely needed). |
 
@@ -62,6 +59,9 @@ ssh my-server
 - **`authorized_keys`** is edited only inside a delimited managed block; your own keys are
   never touched. `~/.ssh/config` is generated so `ssh <name>` needs no user or port
   (Termux's `8022` is injected automatically).
+- **Truecolor everywhere.** Each generated Host stanza sends `COLORTERM=truecolor` and each
+  mesh node's sshd accepts it, so remote TUIs render 24-bit color instead of the washed
+  256-color approximation. Entirely node-local — no tailnet policy edit, no API key.
 - **Transport is hybrid.** A peer running tailssh is reached over the key mesh (reliable,
   no tailnet ACL needed); a Linux/macOS peer *not* in the mesh falls back to keyless
   Tailscale SSH. Peers' sshd host keys are fetched and written to a managed `known_hosts`,

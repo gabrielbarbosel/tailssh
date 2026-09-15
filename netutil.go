@@ -114,6 +114,27 @@ func atomicWrite(path string, data []byte, perm os.FileMode) error {
 	return os.Rename(name, path)
 }
 
+// writeTempFile stages data in a fresh temp file and returns its path; callers
+// remove it when done. Used to hand content to a privileged copy (sudo cp)
+// targeting a root-owned path.
+func writeTempFile(pattern string, data []byte) (string, error) {
+	tmp, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
 // sameContent reports whether path already holds exactly data, to skip no-op writes.
 func sameContent(path string, data []byte) bool {
 	cur, err := os.ReadFile(path)

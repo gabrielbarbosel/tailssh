@@ -103,28 +103,6 @@ func TestHostPattern(t *testing.T) {
 	}
 }
 
-func TestEnsureSSHRule(t *testing.T) {
-	t.Run("existing accept rule is left untouched", func(t *testing.T) {
-		with := `{"ssh": [{"action": "accept", "src": ["autogroup:member"]}]}`
-		if _, changed := ensureSSHRule(with); changed {
-			t.Error("ensureSSHRule modified a policy that already had an accept rule")
-		}
-	})
-	t.Run("policy missing a rule gains exactly one, preserving existing content", func(t *testing.T) {
-		without := "{\n\t// keep this comment\n\t\"acls\": [{\"action\": \"accept\"}],\n\t\"ssh\": [],\n}"
-		got, changed := ensureSSHRule(without)
-		if !changed {
-			t.Fatal("ensureSSHRule did not add a rule to a policy missing one")
-		}
-		if !strings.Contains(got, "keep this comment") || !strings.Contains(got, `"acls"`) {
-			t.Error("ensureSSHRule dropped existing policy content")
-		}
-		if !sshHasAccept(got) {
-			t.Error("ensureSSHRule output has no accept rule")
-		}
-	})
-}
-
 func TestValidateSelfOwner(t *testing.T) {
 	self := &node{StableID: "nSelf", DNSName: "pc.example.ts.net.", UserID: 7}
 	t.Run("resolvable owner passes", func(t *testing.T) {
@@ -237,6 +215,52 @@ func TestSyncTrustedPeers(t *testing.T) {
 		}
 		if owned != nil {
 			t.Errorf("syncTrustedPeers returned peers alongside an error: %v", owned)
+		}
+	})
+}
+
+func TestSSHDConfigWithAcceptEnv(t *testing.T) {
+	stock := "Port 22\n\nMatch Group administrators\n\tAuthorizedKeysFile x/administrators_authorized_keys\n"
+	out, changed := sshdConfigWithAcceptEnv([]byte(stock))
+	t.Run("block is prepended so a trailing Match block cannot capture it", func(t *testing.T) {
+		if !changed {
+			t.Fatal("fresh config reported unchanged")
+		}
+		s := string(out)
+		if !strings.HasPrefix(s, managedBegin+"\n"+sshdAcceptEnvBlock+"\n"+managedEnd+"\n") {
+			t.Errorf("managed block not at the top: %q", s)
+		}
+		if !strings.Contains(s, "Port 22") || !strings.Contains(s, "Match Group administrators") {
+			t.Error("user content dropped")
+		}
+	})
+	t.Run("idempotent on its own output", func(t *testing.T) {
+		again, changed := sshdConfigWithAcceptEnv(out)
+		if changed || string(again) != string(out) {
+			t.Errorf("second pass rewrote the config: %q", string(again))
+		}
+	})
+	t.Run("strip recovers the user's config for uninstall", func(t *testing.T) {
+		if got := strings.TrimLeft(stripManagedBlock(string(out)), "\n"); got != stock {
+			t.Errorf("stripManagedBlock = %q, want %q", got, stock)
+		}
+	})
+}
+
+func TestSSHConfigHostEntryTruecolor(t *testing.T) {
+	wantSetEnv := "SetEnv " + truecolorEnvVar + "=" + truecolorEnvValue
+	paths := sshConfigPaths{identity: "/id"}
+	t.Run("mesh peer stanza asserts truecolor", func(t *testing.T) {
+		keyed := map[string]cachedPeer{"pc": {Name: "pc", User: "u", Port: 22}}
+		entry, ok := sshConfigHostEntry(device{name: "pc", os: "windows"}, keyed, paths)
+		if !ok || !strings.Contains(entry, wantSetEnv) {
+			t.Errorf("mesh stanza lacks %q: %q", wantSetEnv, entry)
+		}
+	})
+	t.Run("Tailscale SSH fallback stanza asserts truecolor too", func(t *testing.T) {
+		entry, ok := sshConfigHostEntry(device{name: "srv", os: "linux"}, nil, paths)
+		if !ok || !strings.Contains(entry, wantSetEnv) {
+			t.Errorf("fallback stanza lacks %q: %q", wantSetEnv, entry)
 		}
 	})
 }

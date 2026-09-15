@@ -104,6 +104,9 @@ func runDaemon(pl Platform) error {
 	if err := pl.EnsureDaemonPersistence(); err != nil {
 		log.Printf("daemon: persistence: %v", err)
 	}
+	if _, err := ensureSSHDAcceptEnv(pl); err != nil {
+		log.Printf("daemon: truecolor: %v", err)
+	}
 	engine.trigger(false)
 	daemonAnnouncePresence()
 	daemonStartSeedLoops(ctx, pl)

@@ -111,6 +111,24 @@ func (p darwinPlatform) EnableSSH() error {
 // SSHListenPort is the standard SSH port on macOS.
 func (darwinPlatform) SSHListenPort() int { return 22 }
 
+// SSHDConfigPath is the stock macOS sshd config.
+func (darwinPlatform) SSHDConfigPath() string { return "/etc/ssh/sshd_config" }
+
+// ReplaceSSHDConfig ships sshd_config through run() (sudo when not root), the
+// same route as every privileged macOS mutation. There is no reload step:
+// launchd spawns sshd per connection, so each new session reads the fresh file.
+func (p darwinPlatform) ReplaceSSHDConfig(data []byte) error {
+	tmp, err := writeTempFile("tailssh-sshd-*.conf", data)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	if err := p.run("cp", tmp, "/etc/ssh/sshd_config"); err != nil {
+		return err
+	}
+	return p.run("chmod", "0644", "/etc/ssh/sshd_config")
+}
+
 // AuthorizedKeysPath returns the current user's authorized_keys file.
 func (darwinPlatform) AuthorizedKeysPath() (string, error) {
 	home, err := os.UserHomeDir()

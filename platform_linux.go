@@ -418,6 +418,56 @@ func termuxShebang() string {
 	return "#!" + termuxPrefix() + "/bin/sh\n"
 }
 
+// SSHDConfigPath is the stock sshd config, under the Termux prefix on Android.
+func (p *linuxPlatform) SSHDConfigPath() string {
+	if p.termux {
+		return filepath.Join(termuxPrefix(), "etc/ssh/sshd_config")
+	}
+	return "/etc/ssh/sshd_config"
+}
+
+// ReplaceSSHDConfig rewrites sshd_config and asks sshd to re-read it. Termux
+// owns its prefix, so a direct atomic write suffices there — and its standalone
+// sshd is left alone (a HUP could drop the listener), picking the file up on
+// its next start. Elsewhere the write goes through run() (sudo when needed) the
+// same way installSystemdDaemon ships the unit file, and the reload is
+// best-effort: a failed reload only defers the change to sshd's next restart.
+func (p *linuxPlatform) ReplaceSSHDConfig(data []byte) error {
+	path := p.SSHDConfigPath()
+	if p.termux {
+		return atomicWrite(path, data, 0o600)
+	}
+	tmp, err := writeTempFile("tailssh-sshd-*.conf", data)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	if err := p.run("cp", tmp, path); err != nil {
+		return err
+	}
+	if err := p.run("chmod", "0644", path); err != nil {
+		return err
+	}
+	p.reloadSSHD()
+	return nil
+}
+
+// reloadSSHD makes the init system re-read sshd_config, trying both unit names
+// (Debian's ssh, Fedora's sshd). try-reload-or-restart no-ops on an inactive
+// unit — socket-activated sshd re-reads the config per connection anyway.
+func (p *linuxPlatform) reloadSSHD() {
+	switch {
+	case hasSystemd():
+		for _, unit := range []string{"ssh", "sshd"} {
+			if p.run("systemctl", "try-reload-or-restart", unit) == nil {
+				return
+			}
+		}
+	case hasOpenRC():
+		_ = p.run("rc-service", "sshd", "reload")
+	}
+}
+
 // EnableSSH makes sshd start on boot and starts it now. With no recognized init
 // system it falls back to a direct sshd start, which has no reboot persistence.
 func (p *linuxPlatform) EnableSSH() error {

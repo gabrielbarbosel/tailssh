@@ -103,6 +103,16 @@ type Platform interface {
 	// UnmountPeer tears down the mount at `at` (drive letter or directory). Idempotent.
 	UnmountPeer(at string) error
 
+	// SSHDConfigPath is the config file this node's sshd reads, which carries
+	// the managed AcceptEnv block (see sshenv.go).
+	SSHDConfigPath() string
+
+	// ReplaceSSHDConfig overwrites sshd_config with data using whatever
+	// privilege path the OS requires, then makes sshd re-read it (a service
+	// reload/restart, or nothing where sshd is spawned per connection and
+	// re-reads on its own). Callers only invoke it with changed content.
+	ReplaceSSHDConfig(data []byte) error
+
 	// ReplaceSelf overwrites the running executable's on-disk file with data (a new
 	// release binary), the OS-correct way: an inode swap on Unix, or rename-aside +
 	// rewrite on Windows (which locks a running image). The caller restarts afterward.

@@ -208,6 +208,13 @@ func cleanupUpdateLeftovers() {
 
 // runUpdate is the `update` command: check once and apply, restarting into the new
 // binary on success. Self-elevates first where a privileged install path needs it.
+//
+// The up-to-date path bounces the daemon too: an update run by an OLDER cli
+// re-execs into this code with the swap already done, and pre-bounce releases
+// left the daemon running the replaced image. A redundant restart costs under a
+// second; a stale daemon serves the mesh old code for a whole update cycle. Its
+// restart error stays quiet — the daemon may simply not be installed, and a
+// genuinely stale one is also healed by the daemon's own drift check.
 func runUpdate(pl Platform) error {
 	if handled, err := pl.EnsurePrivilege(os.Args[1:]); err != nil {
 		return err
@@ -220,6 +227,9 @@ func runUpdate(pl Platform) error {
 	}
 	if !replaced {
 		fmt.Println("tailssh is up to date.")
+		if pl.RestartDaemon() == nil {
+			fmt.Println("daemon restarted — guaranteed to run this binary.")
+		}
 		return nil
 	}
 	fmt.Println("tailssh updated — restarting the daemon into the new binary.")
@@ -229,11 +239,35 @@ func runUpdate(pl Platform) error {
 	return restartSelf()
 }
 
+// onDiskExeSHA hashes the file behind this process's executable path ("" when
+// unreadable). Captured once at daemon start it identifies the image the daemon
+// booted from; a later mismatch means something replaced the binary underneath
+// the running process — a manual `tailssh update`, an older cli, a package
+// manager — without restarting it.
+func onDiskExeSHA() string {
+	exe, err := selfExe()
+	if err != nil {
+		return ""
+	}
+	sum, err := fileSHA256(exe)
+	if err != nil {
+		return ""
+	}
+	return sum
+}
+
 // daemonAutoUpdateLoop checks for a new release on a slow cadence and, when it
 // installs one, restarts the daemon into it. Runs on every device; the first check is
 // delayed so startup spends no time on a round-trip, and a failure just logs and
 // waits for the next tick.
+//
+// Each tick also enforces the invariant "the daemon runs the binary on disk":
+// when the on-disk hash drifts from the boot-time baseline the daemon restarts
+// into the replaced file, needing no network and ignoring the opt-out sentinel
+// (this is correctness, not an unattended download). A swap landing in the
+// exec-to-baseline window at boot is the one drift this cannot see.
 func daemonAutoUpdateLoop(ctx context.Context, pl Platform) {
+	baseline := onDiskExeSHA()
 	timer := time.NewTimer(2 * time.Minute)
 	defer timer.Stop()
 	for {
@@ -241,6 +275,12 @@ func daemonAutoUpdateLoop(ctx context.Context, pl Platform) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+		}
+		if cur := onDiskExeSHA(); baseline != "" && cur != "" && !strings.EqualFold(cur, baseline) {
+			log.Printf("daemon: the on-disk binary changed underneath this process — restarting into it")
+			if err := restartSelf(); err != nil {
+				log.Printf("daemon: restart into the replaced binary: %v", err)
+			}
 		}
 		if !autoUpdateEnabled() {
 			timer.Reset(updateCheckInterval + backoff(0, 5*time.Minute, 5*time.Minute))
